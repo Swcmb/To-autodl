@@ -385,21 +385,11 @@ class CSGLMDAdapter(BaseEncoder):
 class MGACMDAAdapter(BaseEncoder):
     def __init__(self, args):
         super(MGACMDAAdapter, self).__init__(args)
-        import importlib.util, os
-        gate_path = os.path.join(os.path.dirname(__file__), '..', 'MGACMDA', 'gate.py')
-        spec = importlib.util.spec_from_file_location('mgacmda_gate_ext', gate_path)
-        if spec is None or spec.loader is None:
-            raise ImportError(f'Cannot load module spec from {gate_path}')
-        module = importlib.util.module_from_spec(spec)
-        assert spec.loader is not None
-        spec.loader.exec_module(module)
-        ExternalGraphAttentionEncoder = module.GraphAttentionEncoder
-
         in_dim = args.dimensions
         hidden1 = getattr(args, 'hidden1', max(1, in_dim // 2))
         hidden2 = getattr(args, 'hidden2', max(1, in_dim // 4))
         num_heads = getattr(args, 'gat_heads', 4)
-        self.encoder = ExternalGraphAttentionEncoder(in_dim=in_dim, hidden_dims=[hidden1, hidden2], num_heads=num_heads, fc=None)
+        self.encoder = _InternalGraphAttentionEncoder(in_dim=in_dim, hidden_dims=[hidden1, hidden2], num_heads=num_heads, fc=None)
 
         self.mlp1 = nn.Linear(hidden2, hidden2)
         self.disc = Discriminator(hidden2)
@@ -417,18 +407,13 @@ class MGACMDAAdapter(BaseEncoder):
         n = x_o.size(0)
 
         A_o = self.edge_index_to_dense_adj(edge_index, n)
-        A_a = A_o  # 使用相同拓扑对损坏图编码
+        A_a = A_o
 
         x2_o = self.encoder(A_o, x_o)
         x2_o_a = self.encoder(A_a, x_a)
 
-        h_os = self.read(x2_o)
-        h_os = self.sigm(h_os)
-        h_os = self.mlp1(h_os)
-
-        h_os_a = self.read(x2_o_a)
-        h_os_a = self.sigm(h_os_a)
-        h_os_a = self.mlp1(h_os_a)
+        h_os = self.read(x2_o); h_os = self.sigm(h_os); h_os = self.mlp1(h_os)
+        h_os_a = self.read(x2_o_a); h_os_a = self.sigm(h_os_a); h_os_a = self.mlp1(h_os_a)
 
         ret_os = self.disc(h_os, x2_o, x2_o_a)
         ret_os_a = self.disc(h_os_a, x2_o_a, x2_o)
@@ -437,5 +422,73 @@ class MGACMDAAdapter(BaseEncoder):
         log, log1 = self.decoder(entity1, entity2)
 
         logits = adversarial_logits(x2_o, x2_o_a, x2_o.shape[1])
-
         return log, ret_os, ret_os_a, x2_o, logits, log1
+
+# 内置版 GraphAttentionEncoder（参考 MGACMDA/gate.py）
+class _GraphAttentionLayer(nn.Module):
+    def __init__(self, in_features, out_features):
+        super().__init__()
+        self.W = nn.Linear(in_features, out_features, bias=False)
+        self.a = nn.Parameter(torch.empty(size=(2 * out_features, 1)))
+        nn.init.xavier_uniform_(self.a.data, gain=1.414)
+
+    def forward(self, h, adj):
+        Wh = self.W(h)
+        N = Wh.size(0)
+        Wh_repeated_in_chunks = Wh.repeat_interleave(N, dim=0)
+        Wh_repeated_alternating = Wh.repeat(N, 1)
+        all_combinations_matrix = torch.cat([Wh_repeated_in_chunks, Wh_repeated_alternating], dim=1)
+        e = F.leaky_relu(torch.matmul(all_combinations_matrix, self.a).squeeze(1), 0.2).view(N, N)
+        zero_vec = -9e15 * torch.ones_like(e)
+        attention = torch.where(adj > 0, e, zero_vec)
+        attention = F.softmax(attention, dim=1)
+        attention = F.dropout(attention, 0.1, training=self.training)
+        h_prime = torch.matmul(attention, Wh)
+        return F.elu(h_prime)
+
+class _MultiHeadGraphAttentionLayer(nn.Module):
+    def __init__(self, in_features, out_features, num_heads=4):
+        super().__init__()
+        self.num_heads = num_heads
+        self.attention_heads = nn.ModuleList([
+            _GraphAttentionLayer(in_features, out_features) for _ in range(num_heads)
+        ])
+        self.linear = nn.Linear(num_heads * out_features, out_features, bias=False)
+
+    def forward(self, h, adj):
+        head_outputs = [attn_head(h, adj) for attn_head in self.attention_heads]
+        h_prime = torch.cat(head_outputs, dim=1)
+        h_prime = self.linear(h_prime)
+        return F.elu(h_prime)
+
+class _GraphAttentionLayerWithResidual(nn.Module):
+    def __init__(self, in_features, out_features, num_heads=4):
+        super().__init__()
+        self.attention = _MultiHeadGraphAttentionLayer(in_features, out_features, num_heads)
+        self.residual = nn.Linear(in_features, out_features, bias=False)
+
+    def forward(self, h, adj):
+        h_prime = self.attention(h, adj)
+        res = self.residual(h)
+        return F.relu(h_prime + res)
+
+class _InternalGraphAttentionEncoder(nn.Module):
+    def __init__(self, in_dim, hidden_dims, num_heads=3, fc=None):
+        super().__init__()
+        self.fc = fc
+        self.layers = nn.ModuleList()
+        prev_dim = in_dim
+        for out_dim in hidden_dims:
+            self.layers.append(_GraphAttentionLayerWithResidual(prev_dim, out_dim, num_heads))
+            prev_dim = out_dim
+
+    def forward(self, A, X):
+        h = X
+        for layer in self.layers:
+            h = layer(h, A)
+            h = F.relu(h)
+            h = F.dropout(h, p=0.4, training=self.training)
+        if self.fc:
+            h = self.fc(h)
+        embedding = h.clone()
+        return embedding
