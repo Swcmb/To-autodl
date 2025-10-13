@@ -4,6 +4,7 @@ import torch.nn as nn  # 导入PyTorch的神经网络模块
 import matplotlib.pyplot as plt  # 导入matplotlib的绘图库（在此文件中未使用）
 from sklearn.metrics import precision_recall_curve, roc_auc_score, roc_curve, average_precision_score, f1_score, auc  # 从scikit-learn导入各种评估指标函数
 from log_output_manager import get_logger
+from torch.cuda.amp import autocast, GradScaler
 # 使用 main.py 的 redirect_print 统一重定向输出，无需在此处绑定 logger
 
 
@@ -18,6 +19,7 @@ def train_model(model, optimizer, data_o, data_a, train_loader, test_loader, arg
         model.to('cuda')  # 将模型移动到GPU
         data_o.to('cuda')  # 将原始图数据移动到GPU
         data_a.to('cuda')  # 将对抗图数据移动到GPU
+    scaler = GradScaler(enabled=bool(getattr(args, "cuda", False)))
 
     # Train model  # 注释：训练模型
     lbl = data_a.y  # 获取对抗数据的标签（用于对比学习）
@@ -32,30 +34,32 @@ def train_model(model, optimizer, data_o, data_a, train_loader, test_loader, arg
         # 为节点级别的对抗损失创建标签
         lbl_1 = torch.ones(1, 1140)  # 创建全为1的标签（对应原始图节点）
         lbl_2 = torch.zeros(1, 1140)  # 创建全为0的标签（对应损坏图节点）
-        lbl2 = torch.cat((lbl_1, lbl_2),1).cuda()  # 拼接并移动到GPU
+        lbl2 = torch.cat((lbl_1, lbl_2),1).cuda(non_blocking=True)  # 拼接并移动到GPU
 
         for i, (label, inp) in enumerate(train_loader):  # 遍历训练数据加载器，获取每个批次的标签和输入
 
             if args.cuda:  # 如果使用GPU
-                label = label.cuda()  # 将批次标签移动到GPU
+                label = label.cuda(non_blocking=True)  # 将批次标签移动到GPU（非阻塞）
 
             model.train()  # 将模型设置为训练模式
             optimizer.zero_grad()  # 清除上一批次的梯度
-            output, cla_os, cla_os_a, _, logits, log1 = model(data_o, data_a, inp)  # 将数据输入模型，获取多个输出
+            with autocast(enabled=bool(getattr(args, "cuda", False))):
+                output, cla_os, cla_os_a, _, logits, log1 = model(data_o, data_a, inp)  # 将数据输入模型，获取多个输出
 
-            log = torch.squeeze(m(output))  # 对主任务输出应用Sigmoid并压缩维度
-            loss1 = loss_fct(log, label.float())  # 计算主任务的二元交叉熵损失
-            loss2 = b_xent(cla_os, lbl.float())  # 计算第一个对比损失
-            loss3 = b_xent(cla_os_a, lbl.float())  # 计算第二个对比损失
-            loss4 = node_loss(logits, lbl2.float())  # 计算节点级别的对抗损失
-            # 根据预设的权重，将四个损失加权求和得到总损失
-            loss_train = args.loss_ratio1 * loss1 + args.loss_ratio2 * loss2 + args.loss_ratio3 * loss3 \
-                         + args.loss_ratio4 * loss4
+                log = torch.squeeze(m(output))  # 对主任务输出应用Sigmoid并压缩维度
+                loss1 = loss_fct(log, label.float())  # 计算主任务的二元交叉熵损失
+                loss2 = b_xent(cla_os, lbl.float())  # 计算第一个对比损失
+                loss3 = b_xent(cla_os_a, lbl.float())  # 计算第二个对比损失
+                loss4 = node_loss(logits, lbl2.float())  # 计算节点级别的对抗损失
+                # 根据预设的权重，将四个损失加权求和得到总损失
+                loss_train = args.loss_ratio1 * loss1 + args.loss_ratio2 * loss2 + args.loss_ratio3 * loss3 \
+                             + args.loss_ratio4 * loss4
             # print("loss_train: ",loss_train)  # 被注释掉的调试语句
 
             loss_history.append(loss_train.item())  # 记录当前批次的总损失
-            loss_train.backward()  # 反向传播，计算梯度
-            optimizer.step()  # 更新模型参数
+            scaler.scale(loss_train).backward()  # AMP缩放反向传播
+            scaler.step(optimizer)  # AMP优化器步进
+            scaler.update()  # AMP缩放器更新
 
             label_ids = label.to('cpu').numpy()  # 将标签移回CPU并转为numpy数组
             y_label_train = y_label_train + label_ids.flatten().tolist()  # 收集真实标签
@@ -105,24 +109,25 @@ def test(model, loader, data_o, data_a, args):  # 定义测试函数
     # 同样为对抗损失创建标签
     lbl_1 = torch.ones(1, 1140)
     lbl_2 = torch.zeros(1, 1140)
-    lbl2 = torch.cat((lbl_1, lbl_2), 1).cuda()
+    lbl2 = torch.cat((lbl_1, lbl_2), 1).cuda(non_blocking=True)
 
     with torch.no_grad():  # 在此代码块中，不计算梯度，以节省计算资源
         for i, (label, inp) in enumerate(loader):  # 遍历测试数据加载器
 
             if args.cuda:  # 如果使用GPU
-                label = label.cuda()  # 将标签移动到GPU
+                label = label.cuda(non_blocking=True)  # 将标签移动到GPU（非阻塞）
 
-            output, cla_os, cla_os_a, _, logits, log1 = model(data_o, data_a, inp)  # 前向传播
-            log = torch.squeeze(m(output))  # 获取主任务预测概率
+            with autocast(enabled=bool(getattr(args, "cuda", False))):
+                output, cla_os, cla_os_a, _, logits, log1 = model(data_o, data_a, inp)  # 前向传播
+                log = torch.squeeze(m(output))  # 获取主任务预测概率
 
-            # 计算测试集上的损失（尽管在测试阶段通常更关心指标而非损失值）
-            loss1 = loss_fct(log, label.float())
-            loss2 = b_xent(cla_os, lbl.float())
-            loss3 = b_xent(cla_os_a, lbl.float())
-            loss4 = node_loss(logits, lbl2.float())
-            loss = args.loss_ratio1 * loss1 + args.loss_ratio2 * loss2 + args.loss_ratio3 * loss3 \
-                   + args.loss_ratio4 * loss4
+                # 计算测试集上的损失（尽管在测试阶段通常更关心指标而非损失值）
+                loss1 = loss_fct(log, label.float())
+                loss2 = b_xent(cla_os, lbl.float())
+                loss3 = b_xent(cla_os_a, lbl.float())
+                loss4 = node_loss(logits, lbl2.float())
+                loss = args.loss_ratio1 * loss1 + args.loss_ratio2 * loss2 + args.loss_ratio3 * loss3 \
+                       + args.loss_ratio4 * loss4
 
             label_ids = label.to('cpu').numpy()  # 将标签移回CPU
             y_label = y_label + label_ids.flatten().tolist()  # 收集真实标签

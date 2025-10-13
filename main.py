@@ -167,6 +167,15 @@ torch.manual_seed(args.seed)  # 为PyTorch在CPU上的操作设置随机种子�
 # 修复第31行的语法错误
 if args.cuda:  # 如果确定使用CUDA
     torch.cuda.manual_seed(args.seed)  # 也为PyTorch在GPU上的操作设置随机种子
+    # GPU 性能优化：启用 cuDNN benchmark 与 TF32；PyTorch>=2.0 设定更高的 float32 matmul 精度
+    try:
+        torch.backends.cudnn.benchmark = True
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+        if hasattr(torch, "set_float32_matmul_precision"):
+            torch.set_float32_matmul_precision("high")
+    except Exception:
+        pass
 
 
 # load data  # 注释：加载数据
