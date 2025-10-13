@@ -4,13 +4,13 @@ import torch.nn as nn  # 导入PyTorch的神经网络模块
 import matplotlib.pyplot as plt  # 导入matplotlib的绘图库（在此文件中未使用）
 from sklearn.metrics import precision_recall_curve, roc_auc_score, roc_curve, average_precision_score, f1_score, auc  # 从scikit-learn导入各种评估指标函数
 from log_output_manager import get_logger
-from torch.cuda.amp import autocast, GradScaler
+from torch.amp import autocast, GradScaler
 # 使用 main.py 的 redirect_print 统一重定向输出，无需在此处绑定 logger
 
 
 def train_model(model, optimizer, data_o, data_a, train_loader, test_loader, args):  # 定义主训练函数
     m = torch.nn.Sigmoid()  # 实例化Sigmoid函数，用于将模型输出转换为概率
-    loss_fct = torch.nn.BCELoss()  # 实例化二元交叉熵损失函数（用于主任务）
+    loss_fct = nn.BCEWithLogitsLoss()  # 使用对数几率的二元交叉熵（AMP安全，直接用logits）
     b_xent = nn.BCEWithLogitsLoss()  # 实例化带Logits的二元交叉熵损失，更稳定（用于对比和对抗损失）
     node_loss = nn.BCEWithLogitsLoss()  # 同上，用于节点级别的对抗损失
     loss_history = []  # 创建一个列表来记录每个批次的损失值
@@ -19,7 +19,7 @@ def train_model(model, optimizer, data_o, data_a, train_loader, test_loader, arg
         model.to('cuda')  # 将模型移动到GPU
         data_o.to('cuda')  # 将原始图数据移动到GPU
         data_a.to('cuda')  # 将对抗图数据移动到GPU
-    scaler = GradScaler(enabled=bool(getattr(args, "cuda", False)))
+    scaler = GradScaler(device='cuda', enabled=bool(getattr(args, "cuda", False)))
 
     # Train model  # 注释：训练模型
     lbl = data_a.y  # 获取对抗数据的标签（用于对比学习）
@@ -43,11 +43,12 @@ def train_model(model, optimizer, data_o, data_a, train_loader, test_loader, arg
 
             model.train()  # 将模型设置为训练模式
             optimizer.zero_grad()  # 清除上一批次的梯度
-            with autocast(enabled=bool(getattr(args, "cuda", False))):
+            with autocast('cuda', enabled=bool(getattr(args, "cuda", False))):
                 output, cla_os, cla_os_a, _, logits, log1 = model(data_o, data_a, inp)  # 将数据输入模型，获取多个输出
 
-                log = torch.squeeze(m(output))  # 对主任务输出应用Sigmoid并压缩维度
-                loss1 = loss_fct(log, label.float())  # 计算主任务的二元交叉熵损失
+                logits_main = torch.squeeze(output)
+                log = torch.sigmoid(logits_main)
+                loss1 = loss_fct(logits_main, label.float())  # 直接用logits计算，AMP安全
                 loss2 = b_xent(cla_os, lbl.float())  # 计算第一个对比损失
                 loss3 = b_xent(cla_os_a, lbl.float())  # 计算第二个对比损失
                 loss4 = node_loss(logits, lbl2.float())  # 计算节点级别的对抗损失
@@ -117,12 +118,13 @@ def test(model, loader, data_o, data_a, args):  # 定义测试函数
             if args.cuda:  # 如果使用GPU
                 label = label.cuda(non_blocking=True)  # 将标签移动到GPU（非阻塞）
 
-            with autocast(enabled=bool(getattr(args, "cuda", False))):
+            with autocast('cuda', enabled=bool(getattr(args, "cuda", False))):
                 output, cla_os, cla_os_a, _, logits, log1 = model(data_o, data_a, inp)  # 前向传播
-                log = torch.squeeze(m(output))  # 获取主任务预测概率
+                logits_main = torch.squeeze(output)
+                log = torch.sigmoid(logits_main)  # 用于评估指标
 
                 # 计算测试集上的损失（尽管在测试阶段通常更关心指标而非损失值）
-                loss1 = loss_fct(log, label.float())
+                loss1 = loss_fct(logits_main, label.float())
                 loss2 = b_xent(cla_os, lbl.float())
                 loss3 = b_xent(cla_os_a, lbl.float())
                 loss4 = node_loss(logits, lbl2.float())
