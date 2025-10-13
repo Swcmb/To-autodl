@@ -1,6 +1,7 @@
 import torch  # 导入PyTorch深度学习框架
 import numpy as np  # 导入NumPy库，用于进行科学计算，特别是数组操作
 from parms_setting import settings  # 从本地的parms_setting.py文件导入settings函数，用于获取所有超参数
+import os  # 导入os模块，用于与操作系统交互，如此处设置环境变量
 from data_preprocess import load_data  # 从本地的data_preprocess.py文件导入load_data函数，用于加载和预处理数据
 from instantiation import Create_model  # 从本地的instantiation.py文件导入Create_model函数，用于创建模型和优化器
 from train import train_model  # 从本地的train.py文件导入train_model函数，用于执行模型的训练和评估流程
@@ -22,9 +23,32 @@ from log_output_manager import (
 
 # 参数改由 EM/parms_setting.py 统一解析（包含 --run_name 与 --shutdown）
 
+def setup_parallelism(threads: int) -> None:
+    """
+    统一设置数值计算后端线程数，避免线程风暴。
+    不调节 torch.set_num_threads（保持GPU训练不受影响）。
+    """
+    t = int(max(1, min(32, threads)))
+    os.environ["OMP_NUM_THREADS"] = str(t)
+    os.environ["MKL_NUM_THREADS"] = str(t)
+    os.environ["OPENBLAS_NUM_THREADS"] = str(t)
+    os.environ["NUMEXPR_NUM_THREADS"] = str(t)
+    os.environ["VECLIB_MAXIMUM_THREADS"] = str(t)
+    os.environ["BLIS_NUM_THREADS"] = str(t)
+
 # 初始化集中日志（文件+控制台），日志开头记录完整命令
 # 先解析全部参数（含 run_name、shutdown）
 args = settings()
+# 统一并行线程设置（自动探测并裁剪至32）
+setup_parallelism(getattr(args, "threads", 16))
+# 将关键并行参数同步到环境变量，供下游CPU并行计算读取
+try:
+    os.environ["EM_WORKERS"] = str(int(min(32, max(1, getattr(args, "threads", 16)))))
+    os.environ["EM_CHUNK_SIZE"] = str(int(max(1, getattr(args, "chunk_size", 10_000))))
+except Exception as _e:
+    # 防御性处理，避免启动失败
+    os.environ["EM_WORKERS"] = os.environ.get("EM_WORKERS", "16")
+    os.environ["EM_CHUNK_SIZE"] = os.environ.get("EM_CHUNK_SIZE", "10000")
 # 初始化集中日志（文件+控制台），带 run_name
 logger = init_logging(run_name=args.run_name)
 # 重定向所有 print 到日志，同时保留控制台输出

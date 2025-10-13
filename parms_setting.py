@@ -1,4 +1,5 @@
 import argparse  # 导入argparse库，用于解析命令行参数
+import os
 
 def settings():  # 定义一个名为settings的函数，用于设置和返回所有实验参数
     # 创建一个ArgumentParser对象，用于后续添加和解析参数
@@ -139,9 +140,41 @@ def settings():  # 定义一个名为settings的函数，用于设置和返回�
     parser.add_argument('--shutdown', action='store_true',
                         help='Linux only: shutdown after run')
 
+    # 并行/线程控制参数（自动探测，默认启用；上限32）
+    parser.add_argument('--threads', type=int, default=-1,
+                        help='Thread cap for BLAS/NumExpr backends. -1 means auto detect with cap=32.')
+    parser.add_argument('--num_workers', type=int, default=-1,
+                        help='DataLoader workers. -1 means auto detect with cap=32.')
+    parser.add_argument('--prefetch_factor', type=int, default=4,
+                        help='DataLoader prefetch factor (only valid when num_workers>0).')
+    parser.add_argument('--chunk_size', type=int, default=0,
+                        help='Generic chunk size for CPU tasks (0 means auto).')
+    parser.add_argument('--interop_threads', type=int, default=2,
+                        help='Interop threads (kept for compatibility; GPU训练场景通常无需修改).')
+    parser.add_argument('--use_numa', action='store_true',
+                        help='Enable NUMA/affinity hints when available (optional).')
+
 
     # 解析所有添加的参数，并将它们存储在一个命名空间对象中
     args = parser.parse_args()
+    # 并发参数自动探测与裁剪
+    cpu_cnt = os.cpu_count() or 32
+    cap = 32
+    auto_threads = min(cap, max(1, cpu_cnt))
+    if getattr(args, 'threads', -1) is None or args.threads == -1:
+        args.threads = auto_threads
+    else:
+        args.threads = min(cap, max(1, args.threads))
+
+    if getattr(args, 'num_workers', -1) is None or args.num_workers == -1:
+        # 给DataLoader预留空间：默认取 min(threads, 8) 作为初始workers
+        args.num_workers = min(8, args.threads)
+    else:
+        args.num_workers = min(cap, max(0, args.num_workers))
+
+    if getattr(args, 'chunk_size', 0) in (None, 0):
+        # 简单经验：用 10_000 作为缺省CPU任务块大小
+        args.chunk_size = 10_000
     
     # 处理验证类型的格式统一
     if args.validation_type == '5-cv1':
