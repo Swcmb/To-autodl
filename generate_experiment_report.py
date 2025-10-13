@@ -342,7 +342,7 @@ def main():
     parser = argparse.ArgumentParser(description="生成实验报告，并可选择执行命令以在控制台显示输出。")
     parser.add_argument("--execute", choices=["none", "encoders", "fusions", "cross", "all"], default="none",
                         help="选择要执行的命令集合（默认 none，仅生成报告）")
-    parser.add_argument("--limit", type=int, default=0, help="最多执行前 N 条命令（0 表示不限制）")
+
     parser.add_argument("--timeout", type=int, default=0, help="单条命令超时时间（秒，0 表示不限时）")
     args = parser.parse_args()
 
@@ -362,9 +362,15 @@ def main():
         if args.execute in ("cross", "all"):
             to_run.extend(cross_cmds)
 
-        # 限制数量
-        if args.limit and args.limit > 0:
-            to_run = to_run[:args.limit]
+
+
+        # 对最终将被执行的“最后一条命令”追加 --shutdown
+        if to_run:
+            last_name, last_cmd = to_run[-1]
+            if "--shutdown" not in last_cmd:
+                shutdown_cmd = f"{last_cmd} --shutdown"
+                to_run[-1] = (last_name, shutdown_cmd)
+                print(f"\n[提示] 已为最后一条任务 '{last_name}' 追加 --shutdown")
 
         print("\n将开始执行命令，并在控制台实时显示输出：")
         for name, cmd in to_run:
