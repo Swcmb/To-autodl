@@ -1,4 +1,4 @@
-import torch  # 导入PyTorch深度学习框架
+import torch  # 导入PyTorch
 import numpy as np  # 导入NumPy库，用于进行科学计算，特别是数组操作
 from parms_setting import settings  # 从本地的parms_setting.py文件导入settings函数，用于获取所有超参数
 import os  # 导入os模块，用于与操作系统交互，如此处设置环境变量
@@ -10,6 +10,11 @@ import os  # 导入os模块，用于与操作系统交互，如此处设置环�
 import numpy as np
 # 集中日志与结果管理
 import argparse
+import platform  # 检测操作系统平台
+try:
+    import psutil  # CPU亲和设置（可选）
+except Exception:
+    psutil = None
 from log_output_manager import (
     init_logging,
     redirect_print,
@@ -23,32 +28,104 @@ from log_output_manager import (
 
 # 参数改由 EM/parms_setting.py 统一解析（包含 --run_name 与 --shutdown）
 
+def _detect_linux_numa_node0_cpus():
+    """
+    返回Linux下NUMA node0的CPU列表；若不可用则返回None。
+    """
+    try:
+        nodes_path = "/sys/devices/system/node"
+        if not os.path.isdir(nodes_path):
+            return None
+        node0 = os.path.join(nodes_path, "node0")
+        if not os.path.isdir(node0):
+            return None
+        cpu_list = []
+        for name in os.listdir(node0):
+            if name.startswith("cpu") and name[3:].isdigit():
+                cpu_list.append(int(name[3:]))
+        return sorted(cpu_list) if cpu_list else None
+    except Exception:
+        return None
+
+def _set_cpu_affinity_linux(cpus):
+    """
+    将当前进程的CPU亲和性绑定到给定cpus列表。
+    使用psutil优先；无psutil则尝试os.sched_setaffinity。
+    """
+    try:
+        if psutil is not None:
+            p = psutil.Process(os.getpid())
+            p.cpu_affinity(cpus)
+            return True
+    except Exception:
+        pass
+    try:
+        if hasattr(os, "sched_setaffinity"):
+            os.sched_setaffinity(0, set(cpus))
+            return True
+    except Exception:
+        pass
+    return False
+
 def setup_parallelism(threads: int) -> None:
     """
     统一设置数值计算后端线程数，避免线程风暴。
     不调节 torch.set_num_threads（保持GPU训练不受影响）。
+    同时可选启用Linux下的CPU亲和/NUMA绑定（由环境变量控制）。
     """
     t = int(max(1, min(32, threads)))
-    os.environ["OMP_NUM_THREADS"] = str(t)
-    os.environ["MKL_NUM_THREADS"] = str(t)
-    os.environ["OPENBLAS_NUM_THREADS"] = str(t)
-    os.environ["NUMEXPR_NUM_THREADS"] = str(t)
-    os.environ["VECLIB_MAXIMUM_THREADS"] = str(t)
-    os.environ["BLIS_NUM_THREADS"] = str(t)
+    # 统一设置底层库线程数
+    for k in ["OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS", "NUMEXPR_NUM_THREADS", "VECLIB_MAXIMUM_THREADS", "BLIS_NUM_THREADS"]:
+        os.environ[k] = str(t)
+
+    # 可选：CPU亲和/NUMA绑定（仅Linux）
+    try:
+        if platform.system().lower() == "linux":
+            use_aff = os.environ.get("EM_USE_NUMA") == "1" or os.environ.get("EM_CPU_AFFINITY") == "1"
+            if use_aff:
+                cpus = _detect_linux_numa_node0_cpus()
+                if not cpus:
+                    total = os.cpu_count() or 32
+                    cpus = list(range(min(t, total)))
+                ok = _set_cpu_affinity_linux(cpus)
+                # 简要记录亲和结果（不会影响GPU训练）
+                print(f"[AFFINITY] enabled={ok} cpus={cpus[:8]}... total={len(cpus)}")
+    except Exception:
+        # 忽略亲和设置异常，避免影响主流程
+        pass
 
 # 初始化集中日志（文件+控制台），日志开头记录完整命令
 # 先解析全部参数（含 run_name、shutdown）
 args = settings()
-# 统一并行线程设置（自动探测并裁剪至32）
-setup_parallelism(getattr(args, "threads", 16))
-# 将关键并行参数同步到环境变量，供下游CPU并行计算读取
+# Linux 默认启用 NUMA/亲和开关（仅影响CPU亲和，不影响GPU）
 try:
-    os.environ["EM_WORKERS"] = str(int(min(32, max(1, getattr(args, "threads", 16)))))
-    os.environ["EM_CHUNK_SIZE"] = str(int(max(1, getattr(args, "chunk_size", 10_000))))
-except Exception as _e:
+    import platform as _plat
+    if _plat.system().lower() == "linux":
+        if os.environ.get("EM_USE_NUMA") is None and os.environ.get("EM_CPU_AFFINITY") is None:
+            os.environ["EM_USE_NUMA"] = "1"
+except Exception:
+    pass
+
+# 统一并行线程设置（自动探测并裁剪至32）
+setup_parallelism(getattr(args, "threads", 32))
+
+# 将关键并行参数同步到环境变量，供下游CPU并行计算读取（固化默认：workers=8, chunk=20000）
+try:
+    _threads = int(getattr(args, "threads", 32))
+    _workers = int(getattr(args, "num_workers", -1))
+    if _workers == -1:
+        _workers = min(8, max(1, _threads))
+    _chunk = int(getattr(args, "chunk_size", 0))
+    if _chunk in (0, None):
+        _chunk = 20000
+    os.environ["EM_THREADS"] = str(min(32, max(1, _threads)))
+    os.environ["EM_WORKERS"] = str(min(32, max(0, _workers)))
+    os.environ["EM_CHUNK_SIZE"] = str(max(1, _chunk))
+except Exception:
     # 防御性处理，避免启动失败
-    os.environ["EM_WORKERS"] = os.environ.get("EM_WORKERS", "16")
-    os.environ["EM_CHUNK_SIZE"] = os.environ.get("EM_CHUNK_SIZE", "10000")
+    os.environ.setdefault("EM_THREADS", "32")
+    os.environ.setdefault("EM_WORKERS", "8")
+    os.environ.setdefault("EM_CHUNK_SIZE", "20000")
 # 初始化集中日志（文件+控制台），带 run_name
 logger = init_logging(run_name=args.run_name)
 # 重定向所有 print 到日志，同时保留控制台输出
