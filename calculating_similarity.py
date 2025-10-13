@@ -3,6 +3,15 @@ import copy  # 导入copy库，用于创建对象的副本
 import os
 from concurrent.futures import ProcessPoolExecutor, as_completed
 
+def _pbpa_pair(args):
+    """
+    顶层可pickle的worker：计算单对(i,j)的PBPA值
+    args: (i, j, di_sim, rna_di)
+    返回: (i, j, value)
+    """
+    i, j, di_sim, rna_di = args
+    return (i, j, PBPA(i, j, di_sim, rna_di))
+
 "positive sample in test set to 0"  # 这是一个字符串注释，说明下面的函数功能是将测试集中的阳性样本置为0
 def Preproces_Data(A, test_id):  # 定义数据预处理函数，用于在计算相似度前，将测试集中的已知关联暂时移除
     copy_A = A / 1  # 创建关联矩阵A的一个副本，避免修改原始数据
@@ -59,23 +68,16 @@ def getRNA_functional_sim(RNAlen, diSiNet, rna_di):  # 定义函数，用于计�
 
     # 构造(i,j)对列表（上三角）
     pairs = [(i, j) for i in range(RNAlen) for j in range(i + 1, RNAlen)]
-
-    def _worker(batch):
-        out = []
-        for (i, j) in batch:
-            out.append((i, j, PBPA(i, j, diSiNet, rna_di)))
-        return out
-
-    # 按chunk_size切分任务
-    batches = [pairs[k:k + chunk_size] for k in range(0, len(pairs), chunk_size)]
-
-    with ProcessPoolExecutor(max_workers=min(32, max(1, workers))) as ex:
-        futures = [ex.submit(_worker, b) for b in batches]
-        for fu in as_completed(futures):
-            res = fu.result()
-            for i, j, v in res:
-                RNASiNet[i, j] = v
-                RNASiNet[j, i] = v
+    # 迭代器打包参数，避免在子进程中闭包捕获局部变量
+    args_iter = ((i, j, diSiNet, rna_di) for (i, j) in pairs)
+    max_workers = min(32, max(1, workers))
+    # 为executor.map设置合理chunksize：按总任务数/进程数粗略切分
+    total_tasks = len(pairs)
+    chunk = max(1, min(chunk_size, (total_tasks // max_workers) or 1))
+    with ProcessPoolExecutor(max_workers=max_workers) as ex:
+        for i, j, v in ex.map(_pbpa_pair, args_iter, chunksize=chunk):
+            RNASiNet[i, j] = v
+            RNASiNet[j, i] = v
 
     np.fill_diagonal(RNASiNet, 1.0)
     return RNASiNet  # 返回RNA功能相似度网络
