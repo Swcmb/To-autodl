@@ -105,6 +105,13 @@ def settings():  # 定义一个名为settings的函数，用于设置和返回�
     parser.add_argument('--gt_heads', type=int, default=4,
                         help='Number of attention heads for Graph Transformer encoders.')
 
+    # 融合策略参数
+    parser.add_argument('--fusion_type', type=str, default='basic',
+                        choices=['basic','dot','additive','self_attn','gat_fusion','gt_fusion'],
+                        help='Fusion strategy for pairwise interaction.')
+    parser.add_argument('--fusion_heads', type=int, default=4,
+                        help='Number of attention heads for self-attention/GAT/GT fusion (pairwise).')
+
     # 添加新参数以支持您的命令行需求
     # 添加相似度阈值参数
     parser.add_argument('--similarity_threshold', type=float, default=0.5,
@@ -117,6 +124,21 @@ def settings():  # 定义一个名为settings的函数，用于设置和返回�
                         help='Weight for second contrastive learning task. Alias for --loss_ratio3.')
     parser.add_argument('--gamma', dest='loss_ratio4', type=float, default=0.5,
                         help='Weight for adversarial learning task. Alias for --loss_ratio4.')
+
+    # 保存与折数相关参数（主程序接入）
+    parser.add_argument('--save_datasets', type=lambda x: str(x).lower() == 'true', default=True,
+                        help='Whether to save constructed datasets. Use true/false. Default true.')
+    parser.add_argument('--save_format', type=str, default='npy', choices=['npy', 'txt'],
+                        help='Save format for datasets. Default npy.')
+    parser.add_argument('--save_dir_prefix', type=str, default='result/data',
+                        help='Save directory prefix relative to EM/. Default result/data')
+
+    # 运行名称与关机控制（供主程序日志展示与收尾动作）
+    parser.add_argument('--run_name', type=str, default=None,
+                        help='Run name to show in logs and result folder prefix.')
+    parser.add_argument('--shutdown', action='store_true',
+                        help='Linux only: shutdown after run')
+
 
     # 解析所有添加的参数，并将它们存储在一个命名空间对象中
     args = parser.parse_args()

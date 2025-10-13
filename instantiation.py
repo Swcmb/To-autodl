@@ -1,3 +1,4 @@
+"""编码器实验.md"""
 from torch.optim import Adam
 from encoders import EncoderRegistry
 from layer import CSGLMD  # 保留原始 CSGLMD 以兼容默认

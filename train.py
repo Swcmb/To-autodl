@@ -3,6 +3,8 @@ import numpy as np  # 导入NumPy库，用于数值运算
 import torch.nn as nn  # 导入PyTorch的神经网络模块
 import matplotlib.pyplot as plt  # 导入matplotlib的绘图库（在此文件中未使用）
 from sklearn.metrics import precision_recall_curve, roc_auc_score, roc_curve, average_precision_score, f1_score, auc  # 从scikit-learn导入各种评估指标函数
+from log_output_manager import get_logger
+# 使用 main.py 的 redirect_print 统一重定向输出，无需在此处绑定 logger
 
 
 def train_model(model, optimizer, data_o, data_a, train_loader, test_loader, args):  # 定义主训练函数

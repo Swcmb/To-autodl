@@ -84,14 +84,17 @@ if __name__ == '__main__':  # Python主程序入口，当该脚本被直接运�
     mi_dis = np.loadtxt("dataset1/mi_dis.txt")  # 从文件加载miRNA-disease关联矩阵
     lnc_mi = np.loadtxt("dataset1/lnc_mi.txt")  # 从文件加载lncRNA-miRNA关联矩阵
     dis_sem_sim = np.loadtxt("dataset1/dis_sem_sim.txt")  # 从文件加载疾病语义相似度矩阵
-    print(lnc_dis.shape,mi_dis.shape,lnc_mi.shape,dis_sem_sim.shape)  # 打印加载的dataset1各个矩阵的形状
+    from log_output_manager import get_logger
+    _logger = get_logger()
+    _logger.info(f"{lnc_dis.shape} {mi_dis.shape} {lnc_mi.shape} {dis_sem_sim.shape}")
 
     'dataset2'  # 字符串注释，说明下面加载的是dataset2的数据
     lnc_dis = np.loadtxt("dataset1/lnc_dis.txt")  # 从文件加载lncRNA-disease关联矩阵 (注意：路径原文为dataset1，可能是一个笔误)
     mi_dis = np.loadtxt("dataset1/mi_dis.txt")  # 从文件加载miRNA-disease关联矩阵 (注意：路径原文为dataset1)
     lnc_mi = np.loadtxt("dataset1/lnc_mi.txt")  # 从文件加载lncRNA-miRNA关联矩阵 (注意：路径原文为dataset1)
     dis_sem_sim = np.loadtxt("dataset1/dis_sem_sim.txt")  # 从文件加载疾病语义相似度矩阵 (注意：路径原文为dataset1)
-    print(lnc_dis.shape,mi_dis.shape,lnc_mi.shape,dis_sem_sim.shape)  # 打印加载的dataset2各个矩阵的形状
+    _logger = get_logger()
+    _logger.info(f"{lnc_dis.shape} {mi_dis.shape} {lnc_mi.shape} {dis_sem_sim.shape}")
 
     "this example use all sample to calculate"  # 字符串注释，说明这个示例使用所有样本进行计算
 

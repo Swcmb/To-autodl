@@ -1,7 +1,10 @@
+"""编码器实验.md"""
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch_geometric.nn import GATConv, TransformerConv
+from fusion import build_fusion_decoder
+import importlib.util, os
 
 # 统一的读出与判别器（对比学习），对齐 CSGLMD 行为
 class AvgReadout(nn.Module):
@@ -64,7 +67,7 @@ class EncoderRegistry:
     def get(cls, name):
         return cls._registry.get(name)
 
-# 辅助：根据任务类型抽取实体节点嵌入（对齐 CSGLMD 的偏移约定）
+# 辅助：根据任务类型抽取实体节点嵌入（对齐 CSGLMD 的偏移约定）（合并为单一定义）
 def extract_entities(args, x2_o, idx):
     if args.task_type == 'LDA':
         entity1 = x2_o[idx[0]]
@@ -79,41 +82,7 @@ def extract_entities(args, x2_o, idx):
         entity1 = x2_o[idx[0]]
         entity2 = x2_o[idx[1]]
     return entity1, entity2
-def extract_entities(args, x2_o, idx):
-    # 根据任务类型，从批次索引idx中提取要预测的实体对的节点嵌入
-    if args.task_type == 'LDA':  # 如果是lncRNA-Disease任务
-        entity1 = x2_o[idx[0]]  # 获取lncRNA节点的嵌入
-        entity2 = x2_o[idx[1] + 240]  # 获取disease节点的嵌入（240是lncRNA节点数量的偏移）
-        # dataset2
-        # entity1 = x2_o[idx[0]]
-        # entity2 = x2_o[idx[1] + 665]
-    if args.task_type == 'MDA':  # 如果是miRNA-Disease任务
-        #dataset1
-        entity1 = x2_o[idx[0] + 645]  # 获取miRNA节点的嵌入（645是lncRNA+disease节点数量的偏移）
-        entity2 = x2_o[idx[1] + 240]  # 获取disease节点的嵌入
-        # dataset2
-        # entity1 = x2_o[idx[0] + 981]
-        # entity2 = x2_o[idx[1] + 665]
-    if args.task_type == 'LMI':  # 如果是lncRNA-miRNA任务
-        # dataset1
-        entity1 = x2_o[idx[0]]  # 获取lncRNA节点的嵌入
-        entity2 = x2_o[idx[1] + 645]  # 获取miRNA节点的嵌入
-    return entity1, entity2
-# 辅助：交互特征与解码头（加、乘、拼接 -> 线性）
-class InteractionDecoder(nn.Module):
-    def __init__(self, in_dim, decoder1):
-        super(InteractionDecoder, self).__init__()
-        self.fc1 = nn.Linear(in_dim * 4, decoder1)
-        self.fc2 = nn.Linear(decoder1, 1)
-
-    def forward(self, entity1, entity2):
-        add = entity1 + entity2
-        product = entity1 * entity2
-        concatenate = torch.cat((entity1, entity2), dim=1)
-        feature = torch.cat((add, product, concatenate), dim=1)
-        log1 = F.relu(self.fc1(feature))
-        log = self.fc2(log1)
-        return log, log1
+# 交互解码改为可插拔融合模块（见 EM/fusion.py）
 
 # 通用：构造对抗项 logits（与 CSGLMD 接近）
 def adversarial_logits(x2_o, x2_o_a, hidden_dim):
@@ -142,7 +111,7 @@ class GATEncoder(BaseEncoder):
 
         self.mlp1 = nn.Linear(hidden2, hidden2)
         self.disc = Discriminator(hidden2)
-        self.decoder = InteractionDecoder(hidden2, decoder1)
+        self.fusion = build_fusion_decoder(self.args, hidden2)
         self.dropout = dropout
 
     def encode(self, x, edge_index):
@@ -171,7 +140,7 @@ class GATEncoder(BaseEncoder):
         ret_os_a = self.disc(h_os_a, x2_o_a, x2_o)
 
         entity1, entity2 = extract_entities(self.args, x2_o, idx)
-        log, log1 = self.decoder(entity1, entity2)
+        log, log1 = self.fusion(entity1, entity2)
 
         logits = adversarial_logits(x2_o, x2_o_a, x2_o.shape[1])
 
@@ -196,7 +165,7 @@ class GTEncoder(BaseEncoder):
 
         self.mlp1 = nn.Linear(hidden2, hidden2)
         self.disc = Discriminator(hidden2)
-        self.decoder = InteractionDecoder(hidden2, decoder1)
+        self.fusion = build_fusion_decoder(self.args, hidden2)
         self.dropout = dropout
 
     def encode(self, x, edge_index):
@@ -225,7 +194,7 @@ class GTEncoder(BaseEncoder):
         ret_os_a = self.disc(h_os_a, x2_o_a, x2_o)
 
         entity1, entity2 = extract_entities(self.args, x2_o, idx)
-        log, log1 = self.decoder(entity1, entity2)
+        log, log1 = self.fusion(entity1, entity2)
 
         logits = adversarial_logits(x2_o, x2_o_a, x2_o.shape[1])
 
@@ -251,7 +220,7 @@ class GATGTSerial(BaseEncoder):
 
         self.mlp1 = nn.Linear(hidden2, hidden2)
         self.disc = Discriminator(hidden2)
-        self.decoder = InteractionDecoder(hidden2, decoder1)
+        self.fusion = build_fusion_decoder(self.args, hidden2)
         self.dropout = dropout
 
     def encode(self, x, edge_index):
@@ -280,7 +249,7 @@ class GATGTSerial(BaseEncoder):
         ret_os_a = self.disc(h_os_a, x2_o_a, x2_o)
 
         entity1, entity2 = extract_entities(self.args, x2_o, idx)
-        log, log1 = self.decoder(entity1, entity2)
+        log, log1 = self.fusion(entity1, entity2)
 
         logits = adversarial_logits(x2_o, x2_o_a, x2_o.shape[1])
 
@@ -313,7 +282,7 @@ class GATGTParallel(BaseEncoder):
 
         self.mlp1 = nn.Linear(hidden2, hidden2)
         self.disc = Discriminator(hidden2)
-        self.decoder = InteractionDecoder(hidden2, decoder1)
+        self.fusion = build_fusion_decoder(self.args, hidden2)
         self.dropout = dropout
 
     def branch_gat(self, x, edge_index):
@@ -354,7 +323,7 @@ class GATGTParallel(BaseEncoder):
         ret_os_a = self.disc(h_os_a, x2_o_a, x2_o)
 
         entity1, entity2 = extract_entities(self.args, x2_o, idx)
-        log, log1 = self.decoder(entity1, entity2)
+        log, log1 = self.fusion(entity1, entity2)
 
         logits = adversarial_logits(x2_o, x2_o_a, x2_o.shape[1])
 
@@ -365,7 +334,7 @@ class GATGTParallel(BaseEncoder):
 class CSGLMDAdapter(BaseEncoder):
     def __init__(self, args):
         super(CSGLMDAdapter, self).__init__(args)
-        import importlib.util, os
+        
         layer_path = os.path.join(os.path.dirname(__file__), '..', 'CSGLMD-main', 'layer.py')
         spec = importlib.util.spec_from_file_location('csglmd_layer_ext', layer_path)
         if spec is None or spec.loader is None:
