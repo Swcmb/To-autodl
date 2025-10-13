@@ -1,7 +1,6 @@
-import torch  # 导入PyTorch
+import torch  # 导入PyTorch深度学习框架
 import numpy as np  # 导入NumPy库，用于进行科学计算，特别是数组操作
 from parms_setting import settings  # 从本地的parms_setting.py文件导入settings函数，用于获取所有超参数
-import os  # 导入os模块，用于与操作系统交互，如此处设置环境变量
 from data_preprocess import load_data  # 从本地的data_preprocess.py文件导入load_data函数，用于加载和预处理数据
 from instantiation import Create_model  # 从本地的instantiation.py文件导入Create_model函数，用于创建模型和优化器
 from train import train_model  # 从本地的train.py文件导入train_model函数，用于执行模型的训练和评估流程
@@ -29,9 +28,6 @@ from log_output_manager import (
 # 参数改由 EM/parms_setting.py 统一解析（包含 --run_name 与 --shutdown）
 
 def _detect_linux_numa_node0_cpus():
-    """
-    返回Linux下NUMA node0的CPU列表；若不可用则返回None。
-    """
     try:
         nodes_path = "/sys/devices/system/node"
         if not os.path.isdir(nodes_path):
@@ -48,10 +44,6 @@ def _detect_linux_numa_node0_cpus():
         return None
 
 def _set_cpu_affinity_linux(cpus):
-    """
-    将当前进程的CPU亲和性绑定到给定cpus列表。
-    使用psutil优先；无psutil则尝试os.sched_setaffinity。
-    """
     try:
         if psutil is not None:
             p = psutil.Process(os.getpid())
@@ -68,17 +60,11 @@ def _set_cpu_affinity_linux(cpus):
     return False
 
 def setup_parallelism(threads: int) -> None:
-    """
-    统一设置数值计算后端线程数，避免线程风暴。
-    不调节 torch.set_num_threads（保持GPU训练不受影响）。
-    同时可选启用Linux下的CPU亲和/NUMA绑定（由环境变量控制）。
-    """
+    # 统一设置数值后端线程数（不调节 torch.set_num_threads 以免影响 GPU）
     t = int(max(1, min(32, threads)))
-    # 统一设置底层库线程数
     for k in ["OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS", "NUMEXPR_NUM_THREADS", "VECLIB_MAXIMUM_THREADS", "BLIS_NUM_THREADS"]:
         os.environ[k] = str(t)
-
-    # 可选：CPU亲和/NUMA绑定（仅Linux）
+    # 可选：CPU亲和/NUMA绑定（仅Linux，受环境变量 EM_USE_NUMA 或 EM_CPU_AFFINITY 控制）
     try:
         if platform.system().lower() == "linux":
             use_aff = os.environ.get("EM_USE_NUMA") == "1" or os.environ.get("EM_CPU_AFFINITY") == "1"
@@ -87,20 +73,17 @@ def setup_parallelism(threads: int) -> None:
                 if not cpus:
                     total = os.cpu_count() or 32
                     cpus = list(range(min(t, total)))
-                ok = _set_cpu_affinity_linux(cpus)
-                # 简要记录亲和结果（不会影响GPU训练）
-                print(f"[AFFINITY] enabled={ok} cpus={cpus[:8]}... total={len(cpus)}")
+                _ = _set_cpu_affinity_linux(cpus)
     except Exception:
-        # 忽略亲和设置异常，避免影响主流程
         pass
 
 # 初始化集中日志（文件+控制台），日志开头记录完整命令
 # 先解析全部参数（含 run_name、shutdown）
 args = settings()
+
 # Linux 默认启用 NUMA/亲和开关（仅影响CPU亲和，不影响GPU）
 try:
-    import platform as _plat
-    if _plat.system().lower() == "linux":
+    if platform.system().lower() == "linux":
         if os.environ.get("EM_USE_NUMA") is None and os.environ.get("EM_CPU_AFFINITY") is None:
             os.environ["EM_USE_NUMA"] = "1"
 except Exception:
@@ -122,10 +105,10 @@ try:
     os.environ["EM_WORKERS"] = str(min(32, max(0, _workers)))
     os.environ["EM_CHUNK_SIZE"] = str(max(1, _chunk))
 except Exception:
-    # 防御性处理，避免启动失败
     os.environ.setdefault("EM_THREADS", "32")
     os.environ.setdefault("EM_WORKERS", "8")
     os.environ.setdefault("EM_CHUNK_SIZE", "20000")
+
 # 初始化集中日志（文件+控制台），带 run_name
 logger = init_logging(run_name=args.run_name)
 # 重定向所有 print 到日志，同时保留控制台输出

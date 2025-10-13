@@ -362,7 +362,7 @@ class MGACMDAAdapter(BaseEncoder):
 
         self.mlp1 = nn.Linear(hidden2, hidden2)
         self.disc = Discriminator(hidden2)
-        self.decoder = InteractionDecoder(hidden2, getattr(args, 'decoder1', 512))
+        self.fusion = build_fusion_decoder(self.args, hidden2)
         self.dropout = getattr(args, 'dropout', 0.1)
 
     def edge_index_to_dense_adj(self, edge_index, num_nodes):
@@ -388,7 +388,7 @@ class MGACMDAAdapter(BaseEncoder):
         ret_os_a = self.disc(h_os_a, x2_o_a, x2_o)
 
         entity1, entity2 = extract_entities(self.args, x2_o, idx)
-        log, log1 = self.decoder(entity1, entity2)
+        log, log1 = self.fusion(entity1, entity2)
 
         logits = adversarial_logits(x2_o, x2_o_a, x2_o.shape[1])
         return log, ret_os, ret_os_a, x2_o, logits, log1

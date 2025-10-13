@@ -5,7 +5,7 @@ import numpy as np  # 导入numpy库，用于高效的数值计算
 import torch  # 导入PyTorch库，用于深度学习
 import scipy.sparse as sp  # 导入scipy的稀疏矩阵模块，用于处理稀疏数据
 import os  # 基于文件目录解析数据路径
-import time
+import platform  # 按操作系统控制CPU并行策略（Linux开，Windows关）
 from datetime import datetime
 from label_annotation import load_positive, load_negative_all, sample_negative, attach_labels, save_dataset
 from calculating_similarity import calculate_GaussianKernel_sim, getRNA_functional_sim, RNA_fusion_sim, dis_fusion_sim
@@ -52,7 +52,6 @@ def load_data(args, k_fold=5):  # 定义加载数据的主函数，接收命令�
     _logger.info(f"Selected embed_dim: {getattr(args, 'embed_dim', 'N/A')}")
     _logger.info(f"Selected learning_rate: {getattr(args, 'learning_rate', 'N/A')}")
     _logger.info(f"Selected epochs: {getattr(args, 'epochs', 'N/A')}")
-    t_global_start = time.perf_counter()
 
     # 根据 validation_type 实现两种折分割策略
     # 加载正样本与负样本全集，并附加标签
@@ -169,7 +168,6 @@ def load_data(args, k_fold=5):  # 定义加载数据的主函数，接收命令�
                 mat[i, j] = 0
 
     for fold in range(5):
-        t_fold_start = time.perf_counter()
         train_data = train_data_folds[fold]
         test_data = test_data_folds[fold]
         train_positive = train_data[train_data[:, 2] == 1]
@@ -253,15 +251,9 @@ def load_data(args, k_fold=5):  # 定义加载数据的主函数，接收命令�
         else:
             raise ValueError(f"Unknown task_type: {args.task_type}")
 
-        # 记录相似度阶段耗时，并开始图构建计时
-        t_sim_end = time.perf_counter()
-        _logger.info(f"[TIMING] Fold {fold + 1} similarity stage: {(t_sim_end - t_fold_start):.3f}s")
-        t_graph_start = time.perf_counter()
-
         # 构建邻接并归一化
         adj = construct_graph(l_d, m_d, m_l, l_sim, m_sim, d_sim)
         adj = lalacians_norm(adj)
-        t_graph_end = time.perf_counter()
 
         # 边索引
         edges_o = adj.nonzero()
@@ -301,14 +293,22 @@ def load_data(args, k_fold=5):  # 定义加载数据的主函数，接收命令�
         data_o_folds.append(data_o)
         data_a_folds.append(data_a)
 
-        # 特征阶段与整折耗时
-        t_feat_end = time.perf_counter()
-        _logger.info(f"[TIMING] Fold {fold + 1} graph: {(t_graph_end - t_graph_start):.3f}s, features: {(t_feat_end - t_graph_end):.3f}s, fold total: {(t_feat_end - t_fold_start):.3f}s")
+    # 为所有折构建 DataLoader（Linux 自动开启CPU优化，Windows 自动关闭）
+    os_name = platform.system().lower()
+    threads = int(getattr(args, "threads", 32) or 32)
+    req_workers = getattr(args, "num_workers", -1)
+    num_workers = int(req_workers if req_workers is not None else -1)
 
-    # 为所有折构建 DataLoader（优化CPU侧并行）
-    t_loader_start = time.perf_counter()
-    num_workers = int(getattr(args, "num_workers", 0) or 0)
+    if os_name.startswith("win"):
+        # Windows：写死关闭CPU并行数据加载
+        num_workers = 0
+    else:
+        # Linux/mac 等：启用自动并行（与 To-autodl 对齐；NUMA/亲和在 main.py 控制）
+        if num_workers == -1:
+            num_workers = min(8, max(1, threads))
+
     prefetch_factor = int(getattr(args, "prefetch_factor", 4) or 4)
+
     base_params = {'batch_size': args.batch, 'shuffle': True, 'drop_last': True}
     if num_workers > 0:
         base_params.update({
@@ -316,9 +316,13 @@ def load_data(args, k_fold=5):  # 定义加载数据的主函数，接收命令�
             'persistent_workers': True,
             'pin_memory': False
         })
-        # prefetch_factor 仅在 num_workers>0 时有效
         if prefetch_factor and prefetch_factor > 0:
             base_params['prefetch_factor'] = prefetch_factor
+
+    # 记录一次实际使用的 workers 策略
+    _logger = get_logger()
+    _logger.info(f"[DATALOADER] os={os_name} workers={num_workers} prefetch_factor={(base_params.get('prefetch_factor') if num_workers>0 else 0)}")
+
     train_loaders = []
     test_loaders = []
     for fold in range(5):
@@ -326,9 +330,6 @@ def load_data(args, k_fold=5):  # 定义加载数据的主函数，接收命令�
         train_loaders.append(DataLoader(training_set, **base_params))
         test_set = Data_class(test_data_folds[fold])
         test_loaders.append(DataLoader(test_set, **base_params))
-    t_loader_end = time.perf_counter()
-    _logger.info(f"[TIMING] DataLoader build: {(t_loader_end - t_loader_start):.3f}s")
-    _logger.info(f"[TIMING] Preprocess total: {(t_loader_end - t_global_start):.3f}s")
 
     _logger.info('Loading finished!')
     return data_o_folds, data_a_folds, train_loaders, test_loaders

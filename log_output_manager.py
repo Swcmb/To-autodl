@@ -6,8 +6,6 @@ import platform
 import subprocess
 from pathlib import Path
 from typing import Optional, Union, Iterable
-from logging.handlers import QueueHandler, QueueListener
-from multiprocessing import Queue
 
 # 全局状态
 _LOGGER: Optional[logging.Logger] = None
@@ -18,9 +16,6 @@ _OUTPUT_DIR = _BASE_DIR / "OUTPUT"
 _LOG_DIR = _OUTPUT_DIR / "log"
 _RESULT_DIR = _OUTPUT_DIR / "result"
 _RUN_RESULT_DIR: Optional[Path] = None
-# 队列日志
-_QUEUE: Optional[Queue] = None
-_LISTENER: Optional[QueueListener] = None
 
 # 默认格式
 _LOG_FORMAT = "%(asctime)s | %(levelname)s | %(name)s | %(message)s"
@@ -46,8 +41,7 @@ def _compose_log_filename(run_name: Optional[str], run_id: str) -> str:
 
 def init_logging(run_name: Optional[str] = None,
                  level: Union[int, str] = logging.INFO,
-                 to_console: bool = True,
-                 use_queue: bool = True) -> logging.Logger:
+                 to_console: bool = True) -> logging.Logger:
     """
     初始化集中日志（文件+控制台），在日志开头写入完整命令行。
     返回全局 logger，名称为 'EM'.
@@ -71,31 +65,19 @@ def init_logging(run_name: Optional[str] = None,
     logger.setLevel(level)
     logger.propagate = False
 
-    # 目标 handlers（文件+控制台）
+    # 文件 Handler
+    fh = logging.FileHandler(log_file_path, encoding="utf-8")
+    fh.setLevel(level)
     formatter = logging.Formatter(_LOG_FORMAT, datefmt=_DATE_FMT)
-    file_handler = logging.FileHandler(log_file_path, encoding="utf-8")
-    file_handler.setLevel(level)
-    file_handler.setFormatter(formatter)
+    fh.setFormatter(formatter)
+    logger.addHandler(fh)
 
-    handlers = [file_handler]
+    # 控制台 Handler（始终输出到控制台）
     if to_console:
-        console_handler = logging.StreamHandler(sys.stdout)
-        console_handler.setLevel(level)
-        console_handler.setFormatter(formatter)
-        handlers.append(console_handler)
-
-    # 队列聚合：由 QueueListener 消费并写入目标handlers
-    global _QUEUE, _LISTENER
-    if use_queue:
-        _QUEUE = Queue()
-        qh = QueueHandler(_QUEUE)
-        logger.addHandler(qh)
-        _LISTENER = QueueListener(_QUEUE, *handlers, respect_handler_level=True)
-        _LISTENER.start()
-    else:
-        # 回退：直接绑定handlers到logger
-        for h in handlers:
-            logger.addHandler(h)
+        ch = logging.StreamHandler(sys.stdout)
+        ch.setLevel(level)
+        ch.setFormatter(formatter)
+        logger.addHandler(ch)
 
     # 在日志开头记录完整命令行与运行边界
     cmd_line = f"{sys.executable} " + " ".join(sys.argv)
@@ -247,7 +229,7 @@ def save_result_text(content: Union[str, Iterable[str]],
 
 def finalize_run() -> None:
     """
-    记录运行结束边界，并停止队列监听器。
+    记录运行结束边界。
     """
     logger = get_logger()
     border = "=" * 80
@@ -256,16 +238,6 @@ def finalize_run() -> None:
     logger.info(f"RUN END   | run_id={_RUN_ID} | run_name={_RUN_NAME or '-'}")
     logger.info(f"RESULT DIR: {paths.get('run_result_dir')}")
     logger.info(border)
-    # 停止队列监听器
-    global _LISTENER, _QUEUE
-    try:
-        if _LISTENER is not None:
-            _LISTENER.stop()
-            _LISTENER = None
-        _QUEUE = None
-    except Exception:
-        # 避免在关闭阶段因异常中断
-        pass
 
 
 def perform_shutdown_if_linux(shutdown: bool) -> bool:

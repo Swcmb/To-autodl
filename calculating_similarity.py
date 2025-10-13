@@ -1,31 +1,5 @@
 import numpy as np  # 导入numpy库，用于进行数值计算，特别是数组和矩阵操作
 import copy  # 导入copy库，用于创建对象的副本
-import os
-from concurrent.futures import ProcessPoolExecutor, as_completed
-
-# 进程级只读缓存（由 initializer 注入）
-_DI_SIM = None
-_NZ_IDX = None
-
-def _init_pbpa(di_sim, nz_idx):
-    global _DI_SIM, _NZ_IDX
-    _DI_SIM = di_sim
-    _NZ_IDX = nz_idx
-
-def _pbpa_pair_idx(pair):
-    """
-    顶层可pickle的worker：使用预计算索引与进程级只读缓存计算单对(i,j)的PBPA值
-    pair: (i, j)
-    返回: (i, j, value)
-    """
-    i, j = pair
-    idx_i = _NZ_IDX[i]
-    idx_j = _NZ_IDX[j]
-    if len(idx_i) == 0 or len(idx_j) == 0:
-        return (i, j, 0.0)
-    sub = _DI_SIM[np.ix_(idx_i, idx_j)]
-    v = (np.max(sub, axis=0).sum() + np.max(sub, axis=1).sum()) / (sub.shape[0] + sub.shape[1])
-    return (i, j, v)
 
 "positive sample in test set to 0"  # 这是一个字符串注释，说明下面的函数功能是将测试集中的阳性样本置为0
 def Preproces_Data(A, test_id):  # 定义数据预处理函数，用于在计算相似度前，将测试集中的已知关联暂时移除
@@ -36,19 +10,24 @@ def Preproces_Data(A, test_id):  # 定义数据预处理函数，用于在计算
 
 "Gaussiankernel similarity"  # 字符串注释，说明下面是关于高斯核相似度计算的函数
 def calculate_kernel_bandwidth(A):  # 定义函数，用于计算高斯核的带宽参数(gamma)
-    # 向量化：按行求范数平方并求和，避免Python层循环
-    IP_0 = np.sum(np.sum(A * A, axis=1))
-    lambd = 1.0 / ((1.0 / A.shape[0]) * IP_0 + 1e-12)
+    IP_0 = 0  # 初始化变量IP_0，用于累加每个向量的范数平方
+    for i in range(A.shape[0]):  # 遍历矩阵A的每一行（每个实体的关联谱）
+        IP = np.square(np.linalg.norm(A[i]))  # 计算当前行向量的L2范数的平方
+        # print(IP)  # 这是一个被注释掉的调试语句，用于打印每个向量的范数平方
+        IP_0 += IP  # 将计算出的范数平方累加到IP_0
+    lambd = 1/((1/A.shape[0]) * IP_0)  # 根据公式计算带宽参数lambda，通常是基于平均范数平方的倒数
     return lambd  # 返回计算得到的带宽参数
 
 def calculate_GaussianKernel_sim(A):  # 定义函数，用于计算基于关联谱A的高斯核相似度矩阵
-    # 向量化：Gram矩阵与行范数计算所有成对距离，再做RBF
-    gamma = calculate_kernel_bandwidth(A)
-    row_norm_sq = np.sum(A * A, axis=1)  # (n,)
-    G = A @ A.T  # BLAS多线程
-    D = row_norm_sq[:, None] + row_norm_sq[None, :] - 2.0 * G
-    D = np.maximum(D, 0.0)
-    return np.exp(-gamma * D)  # 返回完整的高斯核相似度矩阵
+    kernel_bandwidth = calculate_kernel_bandwidth(A)  # 调用前面的函数计算高斯核的带宽
+    gauss_kernel_sim = np.zeros((A.shape[0],A.shape[0]))  # 初始化一个方阵，用于存储最终的高斯核相似度
+    for i in range(A.shape[0]):  # 遍历矩阵A的每一行
+        for j in range(A.shape[0]):  # 再次遍历矩阵A的每一行，以计算两两之间的相似度
+            gaussianKernel = np.exp(-kernel_bandwidth * np.square(np.linalg.norm(A[i] - A[j])))  # 计算向量A[i]和A[j]之间的高斯核相似度
+            gauss_kernel_sim[i][j] = gaussianKernel  # 将计算出的相似度值存入相似度矩阵
+            # print("gau",gauss_kernel_sim)  # 这是一个被注释掉的调试语句
+
+    return gauss_kernel_sim  # 返回完整的高斯核相似度矩阵
 
 "Functional similarity"  # 字符串注释，说明下面是关于功能相似度计算的函数
 def PBPA(RNA_i, RNA_j, di_sim, rna_di):  # 定义PBPA函数，计算两个RNA（i和j）之间的功能相似度
@@ -62,46 +41,11 @@ def PBPA(RNA_i, RNA_j, di_sim, rna_di):  # 定义PBPA函数，计算两个RNA（
     return (sum(np.max(diseaseSim_ij, axis=0)) + sum(np.max(diseaseSim_ij, axis=1))) / (ijshape[0] + ijshape[1])
 
 def getRNA_functional_sim(RNAlen, diSiNet, rna_di):  # 定义函数，用于计算所有RNA对之间的功能相似度
-    """
-    支持并行（多进程）计算PBPA(i,j)，受环境变量控制：
-      - EM_WORKERS: 进程数（>1启用并行），默认从CPU探测并上限32
-      - EM_CHUNK_SIZE: 任务切片大小，默认10000
-    当进程数<=1时，退化为原始串行实现以保持可复现。
-    """
-    workers = int(os.environ.get("EM_WORKERS", "1"))
-    chunk_size = int(os.environ.get("EM_CHUNK_SIZE", "10000"))
-    RNASiNet = np.zeros((RNAlen, RNAlen), dtype=float)
-
-    if workers <= 1 or RNAlen <= 2:
-        # 串行回退（使用预计算索引以降低循环内开销）
-        nz_idx = [np.flatnonzero(rna_di[row] > 0) for row in range(RNAlen)]
-        for i in range(RNAlen):
-            idx_i = nz_idx[i]
-            for j in range(i + 1, RNAlen):
-                idx_j = nz_idx[j]
-                if len(idx_i) == 0 or len(idx_j) == 0:
-                    val = 0.0
-                else:
-                    sub = diSiNet[np.ix_(idx_i, idx_j)]
-                    val = (np.max(sub, axis=0).sum() + np.max(sub, axis=1).sum()) / (sub.shape[0] + sub.shape[1])
-                RNASiNet[i, j] = RNASiNet[j, i] = val
-        np.fill_diagonal(RNASiNet, 1.0)
-        return RNASiNet
-
-    # 构造(i,j)对列表（上三角）
-    pairs = [(i, j) for i in range(RNAlen) for j in range(i + 1, RNAlen)]
-    # 预计算每行非零索引（小结构，易序列化一次性注入）
-    nz_idx = [np.flatnonzero(rna_di[row] > 0) for row in range(RNAlen)]
-    # 选择更稳妥的进程数，避免调度开销：threads//4，上限8
-    eff_workers = min(8, max(1, workers // 4)) if workers > 4 else max(1, workers)
-    total_tasks = len(pairs)
-    chunk = max(1, (total_tasks // (eff_workers * 4)) or 1)
-    with ProcessPoolExecutor(max_workers=eff_workers, initializer=_init_pbpa, initargs=(diSiNet, nz_idx)) as ex:
-        for i, j, v in ex.map(_pbpa_pair_idx, pairs, chunksize=chunk):
-            RNASiNet[i, j] = v
-            RNASiNet[j, i] = v
-
-    np.fill_diagonal(RNASiNet, 1.0)
+    RNASiNet = np.zeros((RNAlen, RNAlen))  # 初始化一个方阵来存储RNA功能相似度
+    for i in range(RNAlen):  # 遍历所有RNA
+        for j in range(i + 1, RNAlen):  # 遍历i之后的RNA，避免重复计算（因为矩阵是对称的）
+            RNASiNet[i, j] = RNASiNet[j, i] = PBPA(i, j, diSiNet, rna_di)  # 调用PBPA函数计算并填充对称矩阵
+    RNASiNet = RNASiNet + np.eye(RNAlen)  # 将矩阵对角线元素设为1（每个RNA与自身的相似度为1）
     return RNASiNet  # 返回RNA功能相似度网络
 
 "label instantiation"  # 字符串注释，意为“标签实例化”，指将相似度值二值化
