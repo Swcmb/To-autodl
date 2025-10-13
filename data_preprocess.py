@@ -315,7 +315,7 @@ def load_data(args, k_fold=5):  # 定义加载数据的主函数，接收命令�
     if num_workers > 0:
         base_params.update({
             'num_workers': num_workers,
-            'persistent_workers': True
+            'persistent_workers': False
         })
         # prefetch_factor 仅在 num_workers>0 时有效
         if prefetch_factor and prefetch_factor > 0:

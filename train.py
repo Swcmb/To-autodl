@@ -22,7 +22,7 @@ def train_model(model, optimizer, data_o, data_a, train_loader, test_loader, arg
     scaler = GradScaler(device='cuda', enabled=bool(getattr(args, "cuda", False)))
 
     # Train model  # 注释：训练模型
-    lbl = data_a.y  # 获取对抗数据的标签（用于对比学习）
+    lbl = data_a.y.cuda(non_blocking=True) if getattr(args, "cuda", False) else data_a.y  # 获取对抗数据的标签（用于对比学习）
     print('Start Training...')  # 打印开始训练的信息
 
     for epoch in range(args.epochs):  # 开始按设定的轮数进行训练循环
@@ -105,7 +105,7 @@ def test(model, loader, data_o, data_a, args):  # 定义测试函数
     y_pred = []  # 初始化列表，用于存储预测值
     y_label = []  # 初始化列表，用于存储真实标签
     loss = torch.tensor(0.0) # 初始化损失，防止在加载器为空时引用错误
-    lbl = data_a.y  # 获取对抗数据的标签
+    lbl = data_a.y.cuda(non_blocking=True) if getattr(args, "cuda", False) else data_a.y  # 获取对抗数据的标签
 
     # 同样为对抗损失创建标签
     lbl_1 = torch.ones(1, 1140)

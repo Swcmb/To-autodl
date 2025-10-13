@@ -241,6 +241,34 @@ if all_fold_results:
 else:
     logger.info("No results collected.")
 logger.info("All folds completed!")
+
+# 显式关闭 DataLoader 工作线程与 pin_memory 线程，避免进程挂起
+try:
+    _all_loaders = []
+    try:
+        _all_loaders = list(train_loaders) + list(test_loaders)
+    except Exception:
+        pass
+    for _loader in _all_loaders:
+        it = getattr(_loader, "_iterator", None)
+        if it is not None and hasattr(it, "_shutdown_workers"):
+            it._shutdown_workers()
+        # 尝试触发 DataLoader 内部清理
+        if hasattr(_loader, "dataset"):
+            _ = getattr(_loader, "dataset", None)
+        del _loader
+except Exception:
+    pass
+
+# 等待GPU任务完成并尽量释放显存
+try:
+    if args.cuda and torch.cuda.is_available():
+        torch.cuda.synchronize()
+        torch.cuda.empty_cache()
+except Exception:
+    pass
+
+logger.info("Cleanup finished. Proceeding to finalize.")
 # 记录运行结束并（在 Linux 且命令指定时）执行关机
 finalize_run()
 perform_shutdown_if_linux(args.shutdown)
