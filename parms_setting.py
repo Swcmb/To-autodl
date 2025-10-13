@@ -153,6 +153,8 @@ def settings():  # 定义一个名为settings的函数，用于设置和返回�
                         help='Interop threads (kept for compatibility; GPU训练场景通常无需修改).')
     parser.add_argument('--use_numa', action='store_true',
                         help='Enable NUMA/affinity hints when available (optional).')
+    parser.add_argument('--compile', action='store_true',
+                        help='Enable torch.compile for model (PyTorch >= 2.0).')
 
 
     # 解析所有添加的参数，并将它们存储在一个命名空间对象中
