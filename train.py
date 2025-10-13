@@ -96,7 +96,7 @@ def train_model(model, optimizer, data_o, data_a, train_loader, test_loader, arg
 def test(model, loader, data_o, data_a, args):  # 定义测试函数
 
     m = torch.nn.Sigmoid()  # 实例化Sigmoid
-    loss_fct = torch.nn.BCELoss()  # 实例化损失函数
+    loss_fct = nn.BCEWithLogitsLoss()  # 使用对数几率的二元交叉熵（AMP安全，直接用logits）
     b_xent = nn.BCEWithLogitsLoss()
     node_loss = nn.BCEWithLogitsLoss()
 
