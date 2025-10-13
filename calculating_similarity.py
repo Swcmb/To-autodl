@@ -3,19 +3,27 @@ import copy  # 导入copy库，用于创建对象的副本
 import os
 from concurrent.futures import ProcessPoolExecutor, as_completed
 
-def _pbpa_pair_idx(args):
+# 进程级只读缓存（由 initializer 注入）
+_DI_SIM = None
+_NZ_IDX = None
+
+def _init_pbpa(di_sim, nz_idx):
+    global _DI_SIM, _NZ_IDX
+    _DI_SIM = di_sim
+    _NZ_IDX = nz_idx
+
+def _pbpa_pair_idx(pair):
     """
-    顶层可pickle的worker：使用预计算索引计算单对(i,j)的PBPA值
-    args: (i, j, di_sim, nz_idx)
+    顶层可pickle的worker：使用预计算索引与进程级只读缓存计算单对(i,j)的PBPA值
+    pair: (i, j)
     返回: (i, j, value)
     """
-    i, j, di_sim, nz_idx = args
-    idx_i = nz_idx[i]
-    idx_j = nz_idx[j]
+    i, j = pair
+    idx_i = _NZ_IDX[i]
+    idx_j = _NZ_IDX[j]
     if len(idx_i) == 0 or len(idx_j) == 0:
         return (i, j, 0.0)
-    sub = di_sim[np.ix_(idx_i, idx_j)]
-    # (sum max by columns + sum max by rows) / (rows + cols)
+    sub = _DI_SIM[np.ix_(idx_i, idx_j)]
     v = (np.max(sub, axis=0).sum() + np.max(sub, axis=1).sum()) / (sub.shape[0] + sub.shape[1])
     return (i, j, v)
 
@@ -82,16 +90,14 @@ def getRNA_functional_sim(RNAlen, diSiNet, rna_di):  # 定义函数，用于计�
 
     # 构造(i,j)对列表（上三角）
     pairs = [(i, j) for i in range(RNAlen) for j in range(i + 1, RNAlen)]
-    # 预计算每行非零索引（小结构，易序列化）
+    # 预计算每行非零索引（小结构，易序列化一次性注入）
     nz_idx = [np.flatnonzero(rna_di[row] > 0) for row in range(RNAlen)]
-    # 迭代器打包参数，避免闭包捕获
-    args_iter = ((i, j, diSiNet, nz_idx) for (i, j) in pairs)
-    max_workers = min(32, max(1, workers))
-    # 为executor.map设置合理chunksize：按总任务数/进程数粗略切分
+    # 选择更稳妥的进程数，避免调度开销：threads//4，上限8
+    eff_workers = min(8, max(1, workers // 4)) if workers > 4 else max(1, workers)
     total_tasks = len(pairs)
-    chunk = max(1, min(chunk_size, (total_tasks // max_workers) or 1))
-    with ProcessPoolExecutor(max_workers=max_workers) as ex:
-        for i, j, v in ex.map(_pbpa_pair_idx, args_iter, chunksize=chunk):
+    chunk = max(1, (total_tasks // (eff_workers * 4)) or 1)
+    with ProcessPoolExecutor(max_workers=eff_workers, initializer=_init_pbpa, initargs=(diSiNet, nz_idx)) as ex:
+        for i, j, v in ex.map(_pbpa_pair_idx, pairs, chunksize=chunk):
             RNASiNet[i, j] = v
             RNASiNet[j, i] = v
 
