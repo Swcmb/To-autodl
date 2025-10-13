@@ -310,12 +310,11 @@ def load_data(args, k_fold=5):  # 定义加载数据的主函数，接收命令�
     num_workers = int(getattr(args, "num_workers", 0) or 0)
     prefetch_factor = int(getattr(args, "prefetch_factor", 4) or 4)
     base_params = {'batch_size': args.batch, 'shuffle': True, 'drop_last': True}
-    # GPU训练建议启用pin_memory以加速H2D拷贝
-    base_params['pin_memory'] = bool(getattr(args, "cuda", False))
     if num_workers > 0:
         base_params.update({
             'num_workers': num_workers,
-            'persistent_workers': False
+            'persistent_workers': True,
+            'pin_memory': False
         })
         # prefetch_factor 仅在 num_workers>0 时有效
         if prefetch_factor and prefetch_factor > 0:

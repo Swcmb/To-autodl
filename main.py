@@ -167,15 +167,6 @@ torch.manual_seed(args.seed)  # 为PyTorch在CPU上的操作设置随机种子�
 # 修复第31行的语法错误
 if args.cuda:  # 如果确定使用CUDA
     torch.cuda.manual_seed(args.seed)  # 也为PyTorch在GPU上的操作设置随机种子
-    # GPU 性能优化：启用 cuDNN benchmark 与 TF32；PyTorch>=2.0 设定更高的 float32 matmul 精度
-    try:
-        torch.backends.cudnn.benchmark = True
-        torch.backends.cuda.matmul.allow_tf32 = True
-        torch.backends.cudnn.allow_tf32 = True
-        if hasattr(torch, "set_float32_matmul_precision"):
-            torch.set_float32_matmul_precision("high")
-    except Exception:
-        pass
 
 
 # load data  # 注释：加载数据
@@ -241,34 +232,6 @@ if all_fold_results:
 else:
     logger.info("No results collected.")
 logger.info("All folds completed!")
-
-# 显式关闭 DataLoader 工作线程与 pin_memory 线程，避免进程挂起
-try:
-    _all_loaders = []
-    try:
-        _all_loaders = list(train_loaders) + list(test_loaders)
-    except Exception:
-        pass
-    for _loader in _all_loaders:
-        it = getattr(_loader, "_iterator", None)
-        if it is not None and hasattr(it, "_shutdown_workers"):
-            it._shutdown_workers()
-        # 尝试触发 DataLoader 内部清理
-        if hasattr(_loader, "dataset"):
-            _ = getattr(_loader, "dataset", None)
-        del _loader
-except Exception:
-    pass
-
-# 等待GPU任务完成并尽量释放显存
-try:
-    if args.cuda and torch.cuda.is_available():
-        torch.cuda.synchronize()
-        torch.cuda.empty_cache()
-except Exception:
-    pass
-
-logger.info("Cleanup finished. Proceeding to finalize.")
 # 记录运行结束并（在 Linux 且命令指定时）执行关机
 finalize_run()
 perform_shutdown_if_linux(args.shutdown)
