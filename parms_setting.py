@@ -155,6 +155,16 @@ def settings():  # 定义一个名为settings的函数，用于设置和返回�
                         help='Enable NUMA/affinity hints when available (optional).')
     parser.add_argument('--compile', action='store_true',
                         help='Enable torch.compile for model (PyTorch >= 2.0).')
+    # compile 扩展参数（仅在 --compile 时生效；默认不影响行为）
+    parser.add_argument('--compile_mode', type=str, default='reduce-overhead',
+                        choices=['default', 'reduce-overhead', 'max-autotune'],
+                        help='torch.compile mode when --compile is enabled')
+    parser.add_argument('--gemm_backend', type=str, default='auto',
+                        choices=['auto', 'cublas', 'triton'],
+                        help='Limit GEMM autotune backends when --compile is enabled')
+    parser.add_argument('--max_autotune', type=int, default=0,
+                        choices=[0, 1],
+                        help='Enable (1) or disable (0) large-scale autotune when --compile is enabled')
 
 
     # 解析所有添加的参数，并将它们存储在一个命名空间对象中
