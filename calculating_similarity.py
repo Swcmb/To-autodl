@@ -3,14 +3,21 @@ import copy  # 导入copy库，用于创建对象的副本
 import os
 from concurrent.futures import ProcessPoolExecutor, as_completed
 
-def _pbpa_pair(args):
+def _pbpa_pair_idx(args):
     """
-    顶层可pickle的worker：计算单对(i,j)的PBPA值
-    args: (i, j, di_sim, rna_di)
+    顶层可pickle的worker：使用预计算索引计算单对(i,j)的PBPA值
+    args: (i, j, di_sim, nz_idx)
     返回: (i, j, value)
     """
-    i, j, di_sim, rna_di = args
-    return (i, j, PBPA(i, j, di_sim, rna_di))
+    i, j, di_sim, nz_idx = args
+    idx_i = nz_idx[i]
+    idx_j = nz_idx[j]
+    if len(idx_i) == 0 or len(idx_j) == 0:
+        return (i, j, 0.0)
+    sub = di_sim[np.ix_(idx_i, idx_j)]
+    # (sum max by columns + sum max by rows) / (rows + cols)
+    v = (np.max(sub, axis=0).sum() + np.max(sub, axis=1).sum()) / (sub.shape[0] + sub.shape[1])
+    return (i, j, v)
 
 "positive sample in test set to 0"  # 这是一个字符串注释，说明下面的函数功能是将测试集中的阳性样本置为0
 def Preproces_Data(A, test_id):  # 定义数据预处理函数，用于在计算相似度前，将测试集中的已知关联暂时移除
@@ -58,24 +65,33 @@ def getRNA_functional_sim(RNAlen, diSiNet, rna_di):  # 定义函数，用于计�
     RNASiNet = np.zeros((RNAlen, RNAlen), dtype=float)
 
     if workers <= 1 or RNAlen <= 2:
-        # 串行回退
+        # 串行回退（使用预计算索引以降低循环内开销）
+        nz_idx = [np.flatnonzero(rna_di[row] > 0) for row in range(RNAlen)]
         for i in range(RNAlen):
+            idx_i = nz_idx[i]
             for j in range(i + 1, RNAlen):
-                val = PBPA(i, j, diSiNet, rna_di)
+                idx_j = nz_idx[j]
+                if len(idx_i) == 0 or len(idx_j) == 0:
+                    val = 0.0
+                else:
+                    sub = diSiNet[np.ix_(idx_i, idx_j)]
+                    val = (np.max(sub, axis=0).sum() + np.max(sub, axis=1).sum()) / (sub.shape[0] + sub.shape[1])
                 RNASiNet[i, j] = RNASiNet[j, i] = val
         np.fill_diagonal(RNASiNet, 1.0)
         return RNASiNet
 
     # 构造(i,j)对列表（上三角）
     pairs = [(i, j) for i in range(RNAlen) for j in range(i + 1, RNAlen)]
-    # 迭代器打包参数，避免在子进程中闭包捕获局部变量
-    args_iter = ((i, j, diSiNet, rna_di) for (i, j) in pairs)
+    # 预计算每行非零索引（小结构，易序列化）
+    nz_idx = [np.flatnonzero(rna_di[row] > 0) for row in range(RNAlen)]
+    # 迭代器打包参数，避免闭包捕获
+    args_iter = ((i, j, diSiNet, nz_idx) for (i, j) in pairs)
     max_workers = min(32, max(1, workers))
     # 为executor.map设置合理chunksize：按总任务数/进程数粗略切分
     total_tasks = len(pairs)
     chunk = max(1, min(chunk_size, (total_tasks // max_workers) or 1))
     with ProcessPoolExecutor(max_workers=max_workers) as ex:
-        for i, j, v in ex.map(_pbpa_pair, args_iter, chunksize=chunk):
+        for i, j, v in ex.map(_pbpa_pair_idx, args_iter, chunksize=chunk):
             RNASiNet[i, j] = v
             RNASiNet[j, i] = v
 
