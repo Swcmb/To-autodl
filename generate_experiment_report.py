@@ -9,7 +9,7 @@ A_LIST = ["csglmd", "mgacmda", "gat", "gt", "gat_gt_serial", "gat_gt_parallel"]
 B_LIST = ["basic", "dot", "additive", "self_attn", "gat_fusion", "gt_fusion"]
 
 # 用户提供的基础命令（入口由脚本自动探测后替换）
-BASE_STR_USER = "python main.py --file dataset1/LDA.edgelist --neg_sample dataset1/non_LDA.edgelist --validation_type 5-cv1 --task_type LDA --feature_type normal --similarity_threshold 0.5 --embed_dim 64 --learning_rate 0.0005 --weight_decay 0.0005 --epochs 3 --alpha 0.5 --beta 0.5 --gamma 0.5"
+BASE_STR_USER = "python main.py --file dataset1/LDA.edgelist --neg_sample dataset1/non_LDA.edgelist --validation_type 5-cv1 --task_type LDA --feature_type normal --similarity_threshold 0.5 --embed_dim 64 --learning_rate 0.0005 --weight_decay 0.0005 --epochs 3 --alpha 0.5 --beta 0.5 --gamma 0.5 --threads 32 --num_workers 8 --prefetch_factor 4 --chunk_size 10000"
 
 RESULT_ROOT = os.path.join("OUTPUT", "result")
 REPORT_MD = "test.md"
