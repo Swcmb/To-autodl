@@ -188,5 +188,13 @@ def settings():  # 定义一个名为settings的函数，用于设置和返回�
     elif args.validation_type == '5-cv2':
         args.validation_type = '5_cv2'
 
+    # MoCo proj_dim 兜底：默认随 hidden2
+    try:
+        pd = getattr(args, "proj_dim", None)
+        if pd is None or int(pd) <= 0:
+            args.proj_dim = args.hidden2
+    except Exception:
+        args.proj_dim = args.hidden2
+
     # 返回包含所有参数设置的对象
     return args
