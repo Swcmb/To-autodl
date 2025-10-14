@@ -163,10 +163,23 @@ def load_data(args, k_fold=5):  # 定义加载数据的主函数，接收命令�
     dis_sem_sim = np.loadtxt(_p("dataset1/dis_sem_sim.txt"))
 
     def mask_pairs(mat, pairs):
-        # 将测试集关联位置置 0（临时掩码）
-        for i, j in pairs:
-            if 0 <= i < mat.shape[0] and 0 <= j < mat.shape[1]:
-                mat[i, j] = 0
+        # 将测试集关联位置置 0（临时掩码）——向量化以避免 Python 循环
+        if pairs is None:
+            return
+        try:
+            if len(pairs) == 0:
+                return
+        except TypeError:
+            # 非可迭代或非预期类型，直接返回
+            return
+        p = np.asarray(pairs, dtype=int)
+        if p.ndim != 2 or p.shape[1] != 2:
+            return
+        r = p[:, 0]
+        c = p[:, 1]
+        mask = (r >= 0) & (r < mat.shape[0]) & (c >= 0) & (c < mat.shape[1])
+        if np.any(mask):
+            mat[r[mask], c[mask]] = 0
 
     for fold in range(5):
         train_data = train_data_folds[fold]
@@ -289,13 +302,18 @@ def load_data(args, k_fold=5):  # 定义加载数据的主函数，接收命令�
         if base_seed is None:
             base_seed = int(getattr(args, "seed", 0)) + fold
 
-        features_a = apply_augmentation(
-            aug_name,
-            features_o,
-            noise_std=noise_std,
-            mask_rate=mask_rate,
-            seed=base_seed
-        )
+        _aug_key = (aug_name or "").strip().lower()
+        if _aug_key in {"", "none", "null"}:
+            # 无增强：直接引用原特征，避免不必要拷贝/转换
+            features_a = features_o
+        else:
+            features_a = apply_augmentation(
+                aug_name,
+                features_o,
+                noise_std=noise_std,
+                mask_rate=mask_rate,
+                seed=base_seed
+            )
 
         # 日志记录增强统计
         try:
