@@ -4,6 +4,8 @@ import torch.nn as nn  # 导入PyTorch的神经网络模块
 import matplotlib.pyplot as plt  # 导入matplotlib的绘图库（在此文件中未使用）
 from sklearn.metrics import precision_recall_curve, roc_auc_score, roc_curve, average_precision_score, f1_score, auc  # 从scikit-learn导入各种评估指标函数
 from log_output_manager import get_logger
+from enhance import apply_augmentation
+from torch_geometric.data import Data
 # 使用 main.py 的 redirect_print 统一重定向输出，无需在此处绑定 logger
 
 
@@ -11,6 +13,7 @@ def train_model(model, optimizer, data_o, data_a, train_loader, test_loader, arg
     m = torch.nn.Sigmoid()  # 实例化Sigmoid函数，用于将模型输出转换为概率
     loss_fct = torch.nn.BCELoss()  # 实例化二元交叉熵损失函数（用于主任务）
     b_xent = nn.BCEWithLogitsLoss()  # 实例化带Logits的二元交叉熵损失，更稳定（用于对比和对抗损失）
+    ce_loss = nn.CrossEntropyLoss()  # 用于 MoCo InfoNCE
     node_loss = nn.BCEWithLogitsLoss()  # 同上，用于节点级别的对抗损失
     loss_history = []  # 创建一个列表来记录每个批次的损失值
 
@@ -18,6 +21,16 @@ def train_model(model, optimizer, data_o, data_a, train_loader, test_loader, arg
         model.to('cuda')  # 将模型移动到GPU
         data_o.to('cuda')  # 将原始图数据移动到GPU
         data_a.to('cuda')  # 将对抗图数据移动到GPU
+    device = 'cuda' if args.cuda else 'cpu'
+    aug_mode = getattr(args, 'augment_mode', 'static')
+    aug_name = getattr(args, 'augment', 'random_permute_features')
+    # 若传入多种增强，在线增强仅取第一个，保持稳定
+    aug_online = aug_name[0] if isinstance(aug_name, (list, tuple)) and len(aug_name) > 0 else aug_name
+    noise_std = float(getattr(args, 'noise_std', 0.01) or 0.01)
+    mask_rate = float(getattr(args, 'mask_rate', 0.1) or 0.1)
+    base_seed = getattr(args, 'augment_seed', None)
+    if base_seed is None:
+        base_seed = int(getattr(args, 'seed', 0))
 
     # Train model  # 注释：训练模型
     lbl = data_a.y  # 获取对抗数据的标签（用于对比学习）
@@ -29,24 +42,53 @@ def train_model(model, optimizer, data_o, data_a, train_loader, test_loader, arg
         y_label_train = []  # 初始化列表，用于存储当前轮次的真实标签
         loss_train = torch.tensor(0.0) # 初始化训练损失，防止在训练加载器为空时引用错误
 
-        # 为节点级别的对抗损失创建标签
-        lbl_1 = torch.ones(1, 1140)  # 创建全为1的标签（对应原始图节点）
-        lbl_2 = torch.zeros(1, 1140)  # 创建全为0的标签（对应损坏图节点）
-        lbl2 = torch.cat((lbl_1, lbl_2),1).cuda()  # 拼接并移动到GPU
+        # 为节点级别的对抗损失创建标签（动态节点数 + 设备对齐）
+        n_nodes = int(data_o.x.size(0))
+        lbl_1 = torch.ones(1, n_nodes, device=device)
+        lbl_2 = torch.zeros(1, n_nodes, device=device)
+        lbl2 = torch.cat((lbl_1, lbl_2), 1)
 
         for i, (label, inp) in enumerate(train_loader):  # 遍历训练数据加载器，获取每个批次的标签和输入
 
             if args.cuda:  # 如果使用GPU
                 label = label.cuda()  # 将批次标签移动到GPU
 
+            # 在线增强：每个 batch 动态生成 data_a_aug
+            if aug_mode == 'online':
+                # 为每个 batch 派生稳定种子：seed + epoch*1000 + iter
+                seed_batch = int(base_seed) + epoch * 1000 + i
+                # apply_augmentation 支持 torch.Tensor；返回 CPU 张量，需移回原 device
+                aug_x = apply_augmentation(
+                    aug_online,
+                    data_a.x,  # 可直接传 torch.Tensor
+                    noise_std=noise_std,
+                    mask_rate=mask_rate,
+                    seed=seed_batch
+                )
+                if isinstance(aug_x, torch.Tensor):
+                    aug_x = aug_x.to(device)
+                else:
+                    aug_x = torch.tensor(aug_x, dtype=data_a.x.dtype, device=device)
+                # 构造仅替换 x 的临时 Data；共享 edge_index 与 y
+                data_a_aug = Data(x=aug_x, y=data_a.y, edge_index=data_a.edge_index)
+                if i == 0:
+                    print(f"[ONLINE-AUG] mode=online name={aug_online} noise_std={noise_std} mask_rate={mask_rate} base_seed={base_seed}")
+            else:
+                data_a_aug = data_a
+
             model.train()  # 将模型设置为训练模式
             optimizer.zero_grad()  # 清除上一批次的梯度
-            output, cla_os, cla_os_a, _, logits, log1 = model(data_o, data_a, inp)  # 将数据输入模型，获取多个输出
+            output, cla_os, cla_os_a, _, logits, log1 = model(data_o, data_a_aug, inp)  # 将数据输入模型，获取多个输出
 
             log = torch.squeeze(m(output))  # 对主任务输出应用Sigmoid并压缩维度
             loss1 = loss_fct(log, label.float())  # 计算主任务的二元交叉熵损失
-            loss2 = b_xent(cla_os, lbl.float())  # 计算第一个对比损失
-            loss3 = b_xent(cla_os_a, lbl.float())  # 计算第二个对比损失
+            # MoCo：支持单/多视图
+            if isinstance(cla_os, (list, tuple)):
+                losses = [ce_loss(lg, tg) for lg, tg in zip(cla_os, cla_os_a)]
+                loss2 = torch.stack(losses).mean()
+            else:
+                loss2 = ce_loss(cla_os, cla_os_a)
+            loss3 = torch.tensor(0.0, device=(cla_os[0].device if isinstance(cla_os, (list, tuple)) else cla_os.device))
             loss4 = node_loss(logits, lbl2.float())  # 计算节点级别的对抗损失
             # 根据预设的权重，将四个损失加权求和得到总损失
             loss_train = args.loss_ratio1 * loss1 + args.loss_ratio2 * loss2 + args.loss_ratio3 * loss3 \
@@ -62,16 +104,17 @@ def train_model(model, optimizer, data_o, data_a, train_loader, test_loader, arg
             y_pred_train = y_pred_train + log.flatten().tolist()  # 收集预测概率
 
             if i % 100 == 0:  # 每100个批次
-                # 打印当前轮次、迭代次数和训练损失
+                # 打印当前轮次、迭代次数和训练损失（含分项：task/contrastive/adversarial）
                 print('epoch: ' + str(epoch + 1) + '/ iteration: ' + str(i + 1) + '/ loss_train: ' + str(
-                    loss_train.cpu().detach().numpy()))
+                    loss_train.cpu().detach().numpy()) + ' | task_loss:' + format(loss1.item(), '.4f') + ' cont_loss:' + format(loss2.item(), '.4f') + ' adv_loss:' + format(loss4.item(), '.4f'))
 
         # 在训练集非空时计算AUROC，否则为0，避免程序出错
         roc_train = roc_auc_score(y_label_train, y_pred_train) if y_label_train else 0.0
 
         # 打印当前轮次的总结信息
         print('epoch: {:04d}'.format(epoch + 1),'loss_train: {:.4f}'.format(loss_train.item()),
-                'auroc_train: {:.4f}'.format(roc_train))
+                'task_loss: {:.4f}'.format(loss1.item()), 'cont_loss: {:.4f}'.format(loss2.item()),
+                'adv_loss: {:.4f}'.format(loss4.item()), 'auroc_train: {:.4f}'.format(roc_train))
 
         if hasattr(torch.cuda, 'empty_cache'):  # 如果PyTorch版本支持
             torch.cuda.empty_cache()  # 清空GPU缓存，释放不必要的显存
@@ -93,6 +136,7 @@ def test(model, loader, data_o, data_a, args):  # 定义测试函数
     m = torch.nn.Sigmoid()  # 实例化Sigmoid
     loss_fct = torch.nn.BCELoss()  # 实例化损失函数
     b_xent = nn.BCEWithLogitsLoss()
+    ce_loss = nn.CrossEntropyLoss()
     node_loss = nn.BCEWithLogitsLoss()
 
 
@@ -102,10 +146,12 @@ def test(model, loader, data_o, data_a, args):  # 定义测试函数
     loss = torch.tensor(0.0) # 初始化损失，防止在加载器为空时引用错误
     lbl = data_a.y  # 获取对抗数据的标签
 
-    # 同样为对抗损失创建标签
-    lbl_1 = torch.ones(1, 1140)
-    lbl_2 = torch.zeros(1, 1140)
-    lbl2 = torch.cat((lbl_1, lbl_2), 1).cuda()
+    # 同样为对抗损失创建标签（动态节点数 + 设备对齐）
+    device = 'cuda' if args.cuda else 'cpu'
+    n_nodes = int(data_o.x.size(0))
+    lbl_1 = torch.ones(1, n_nodes, device=device)
+    lbl_2 = torch.zeros(1, n_nodes, device=device)
+    lbl2 = torch.cat((lbl_1, lbl_2), 1)
 
     with torch.no_grad():  # 在此代码块中，不计算梯度，以节省计算资源
         for i, (label, inp) in enumerate(loader):  # 遍历测试数据加载器
@@ -113,13 +159,18 @@ def test(model, loader, data_o, data_a, args):  # 定义测试函数
             if args.cuda:  # 如果使用GPU
                 label = label.cuda()  # 将标签移动到GPU
 
+            # 测试阶段不进行在线增强，保持 data_a 静态
             output, cla_os, cla_os_a, _, logits, log1 = model(data_o, data_a, inp)  # 前向传播
             log = torch.squeeze(m(output))  # 获取主任务预测概率
 
             # 计算测试集上的损失（尽管在测试阶段通常更关心指标而非损失值）
             loss1 = loss_fct(log, label.float())
-            loss2 = b_xent(cla_os, lbl.float())
-            loss3 = b_xent(cla_os_a, lbl.float())
+            if isinstance(cla_os, (list, tuple)):
+                losses = [ce_loss(lg, tg) for lg, tg in zip(cla_os, cla_os_a)]
+                loss2 = torch.stack(losses).mean()
+            else:
+                loss2 = ce_loss(cla_os, cla_os_a)
+            loss3 = torch.tensor(0.0, device=(cla_os[0].device if isinstance(cla_os, (list, tuple)) else cla_os.device))
             loss4 = node_loss(logits, lbl2.float())
             loss = args.loss_ratio1 * loss1 + args.loss_ratio2 * loss2 + args.loss_ratio3 * loss3 \
                    + args.loss_ratio4 * loss4

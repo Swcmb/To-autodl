@@ -36,6 +36,19 @@ def settings():  # 定义一个名为settings的函数，用于设置和返回�
     parser.add_argument('--feature_type', type=str, default='normal', choices=['one_hot', 'uniform', 'normal', 'position'],
                         help='Initial node feature type. Default is position.')
 
+    # 图特征增强设置
+    parser.add_argument('--augment', nargs='+', type=str, default=['random_permute_features'],
+                        choices=['none', 'random_permute_features', 'add_noise', 'attribute_mask', 'noise_then_mask'],
+                        help='Graph feature augmentation(s) to build the augmented view (data_a). Multiple choices allowed, e.g., --augment add_noise attribute_mask. Default is [random_permute_features].')
+    parser.add_argument('--noise_std', type=float, default=0.01,
+                        help='Std of Gaussian noise for add_noise/noise_then_mask. Default 0.01.')
+    parser.add_argument('--mask_rate', type=float, default=0.1,
+                        help='Global column mask rate for attribute_mask/noise_then_mask. Default 0.1.')
+    parser.add_argument('--augment_seed', type=int, default=None,
+                        help='Optional seed for augmentation. If None, uses seed+fold.')
+    parser.add_argument('--augment_mode', type=str, default='static', choices=['static', 'online'],
+                        help='Augmentation mode: static (per-fold, offline) or online (per-batch during training). Default static.')
+
     # Training settings  # 注释：训练设置
     # 添加'--lr'参数，设置优化器的初始学习率
     parser.add_argument('--lr', type=float, default=5e-4,
@@ -111,6 +124,22 @@ def settings():  # 定义一个名为settings的函数，用于设置和返回�
                         help='Fusion strategy for pairwise interaction.')
     parser.add_argument('--fusion_heads', type=int, default=4,
                         help='Number of attention heads for self-attention/GAT/GT fusion (pairwise).')
+
+    # MoCo v2 参数（单视图起步）
+    parser.add_argument('--moco_queue', type=int, default=4096,
+                        help='MoCo queue size. Default 4096.')
+    parser.add_argument('--moco_momentum', type=float, default=0.999,
+                        help='MoCo momentum m. Default 0.999.')
+    parser.add_argument('--moco_t', type=float, default=0.2,
+                        help='MoCo temperature T. Default 0.2.')
+    parser.add_argument('--proj_dim', type=int, default=None,
+                        help='Projection dimension. Default follows hidden2.')
+    parser.add_argument('--num_views', type=int, default=1,
+                        help='Number of augmented views for MoCo (start with 1).')
+    parser.add_argument('--queue_warmup_steps', type=int, default=0,
+                        help='Steps to disable MoCo queue and use only batch negatives at early training.')
+    parser.add_argument('--moco_debug', type=int, default=0,
+                        help='Enable lightweight MoCo debug logs (0/1).')
 
     # CPU 并行与数据加载参数（与 To-autodl 对齐）
     parser.add_argument('--threads', type=int, default=32,

@@ -10,6 +10,7 @@ from datetime import datetime
 from label_annotation import load_positive, load_negative_all, sample_negative, attach_labels, save_dataset
 from calculating_similarity import calculate_GaussianKernel_sim, getRNA_functional_sim, RNA_fusion_sim, dis_fusion_sim
 from log_output_manager import get_logger
+from enhance import apply_augmentation
 
 # 统一路径解析：若为相对路径，则相对 EM 目录解析
 BASE_DIR = os.path.dirname(__file__)
@@ -277,10 +278,32 @@ def load_data(args, k_fold=5):  # 定义加载数据的主函数，接收命令�
         if fold == 0:
             args.dimensions = features_o.shape[1]
 
-        # 对抗特征
-        np.random.seed(args.seed)
-        id_perm = np.random.permutation(np.arange(features_o.shape[0]))
-        features_a = features_o[id_perm]
+        # 对抗/增强特征视图：根据 --augment 选择增强（默认 random_permute_features）
+        aug_name = getattr(args, "augment", "random_permute_features")
+        # 兼容多选增强：静态构图阶段仅取第一个增强名
+        if isinstance(aug_name, (list, tuple)):
+            aug_name = aug_name[0] if len(aug_name) > 0 else "random_permute_features"
+        noise_std = float(getattr(args, "noise_std", 0.01) or 0.01)
+        mask_rate = float(getattr(args, "mask_rate", 0.1) or 0.1)
+        base_seed = getattr(args, "augment_seed", None)
+        if base_seed is None:
+            base_seed = int(getattr(args, "seed", 0)) + fold
+
+        features_a = apply_augmentation(
+            aug_name,
+            features_o,
+            noise_std=noise_std,
+            mask_rate=mask_rate,
+            seed=base_seed
+        )
+
+        # 日志记录增强统计
+        try:
+            _alog = get_logger("augment")
+            masked_cols = int(np.sum(np.all(features_a == 0, axis=0))) if isinstance(features_a, np.ndarray) else 0
+            _alog.info(f"[AUGMENT][fold={fold+1}] name={aug_name} noise_std={noise_std} mask_rate={mask_rate} seed={base_seed} masked_cols={masked_cols} shape={features_a.shape} mean={np.mean(features_a):.4f} std={np.std(features_a):.4f}")
+        except Exception:
+            pass
 
         y_a = torch.cat((torch.ones(adj.shape[0], 1), torch.zeros(adj.shape[0], 1)), dim=1)
 

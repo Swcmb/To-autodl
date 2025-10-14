@@ -3,6 +3,7 @@ import torch  # 导入PyTorch主库
 import torch.nn as nn  # 导入PyTorch的神经网络模块，用于构建网络层
 import torch.nn.functional as F  # 导入PyTorch的函数模块，用于激活函数、dropout等
 from torch_geometric.nn import GCNConv  # 从PyTorch Geometric库导入图卷积网络层
+from contrastive_learning import Discriminator  # 统一对比学习判别器
 from parms_setting import settings  # 从本地的parms_setting.py文件导入settings函数
 args = settings()  # 调用settings函数获取并存储所有超参数
 
@@ -11,34 +12,7 @@ def reset_parameters(w):  # 定义一个函数来重置权重参数
     stdv = 1. / math.sqrt(w.size(0))  # 计算标准差，用于均匀分布的范围
     w.data.uniform_(-stdv, stdv)  # 在[-stdv, stdv]范围内均匀地初始化权重数据
 
-class Discriminator(nn.Module):  # 定义一个判别器类，用于对比学习
-    def __init__(self, n_h):  # 初始化方法，n_h是隐藏层维度
-        super(Discriminator, self).__init__()  # 调用父类的初始化方法
-        self.f_k = nn.Bilinear(n_h, n_h, 1)  # 定义一个双线性层，用于计算两个输入的相似度得分
 
-        for m in self.modules():  # 遍历模型的所有模块
-            self.weights_init(m)  # 对每个模块进行权重初始化
-
-    def weights_init(self, m):  # 定义权重初始化方法
-        if isinstance(m, nn.Bilinear):  # 如果模块是双线性层
-            torch.nn.init.xavier_uniform_(m.weight.data)  # 使用Xavier均匀分布初始化权重
-            if m.bias is not None:  # 如果有偏置项
-                m.bias.data.fill_(0.0)  # 将偏置项填充为0
-
-    def forward(self, c, h_pl, h_mi, s_bias1 = None, s_bias2 = None):  # 定义前向传播
-        c_x = c.expand_as(h_pl)  # 将全局图表示c扩展成与局部节点表示h_pl相同的形状
-
-        sc_1 = self.f_k(h_pl, c_x)  # 计算正样本（原始图节点）与全局表示的相似度得分
-        sc_2 = self.f_k(h_mi, c_x)  # 计算负样本（损坏图节点）与全局表示的相似度得分
-
-        if s_bias1 is not None:  # 如果有额外的偏置项1
-            sc_1 += s_bias1  # 添加到正样本得分上
-        if s_bias2 is not None:  # 如果有额外的偏置项2
-            sc_2 += s_bias2  # 添加到负样本得分上
-
-        logits = torch.cat((sc_1, sc_2), 1)  # 将正负样本的得分拼接在一起
-
-        return logits  # 返回拼接后的得分
 
 
 class AvgReadout(nn.Module):  # 定义一个平均读出（Readout）层，用于从节点表示生成图级别的表示

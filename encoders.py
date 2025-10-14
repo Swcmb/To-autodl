@@ -4,7 +4,26 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch_geometric.nn import GATConv, TransformerConv
 from fusion import build_fusion_decoder
+from contrastive_learning import Discriminator, MoCoV2SingleView, MoCoV2MultiView
+from enhance import apply_augmentation
 import importlib.util, os
+
+# 轻量断言工具（接口一致性）
+def _assert_tensor_2d(x: torch.Tensor, name: str):
+    if not isinstance(x, torch.Tensor) or x.dim() != 2:
+        raise TypeError(f"{name} must be a 2D torch.Tensor, got {type(x)} with shape {getattr(x, 'shape', None)}")
+
+def _assert_edge_index(edge_index: torch.Tensor, name: str):
+    if not isinstance(edge_index, torch.Tensor):
+        raise TypeError(f"{name} must be a torch.Tensor")
+    if edge_index.dim() != 2 or edge_index.size(0) != 2:
+        raise ValueError(f"{name} must have shape [2, E], got {tuple(edge_index.shape)}")
+    if edge_index.dtype not in (torch.long, torch.int64, torch.int32, torch.int16):
+        raise TypeError(f"{name} dtype must be integer type, got {edge_index.dtype}")
+
+def _assert_dense_adj(A: torch.Tensor, N: int, name: str):
+    if not isinstance(A, torch.Tensor) or A.dim() != 2 or A.size(0) != N or A.size(1) != N:
+        raise ValueError(f"{name} must be dense square adj of shape [{N},{N}], got {getattr(A, 'shape', None)}")
 
 # 统一的读出与判别器（对比学习），对齐 CSGLMD 行为
 class AvgReadout(nn.Module):
@@ -18,29 +37,7 @@ class AvgReadout(nn.Module):
             msk = torch.unsqueeze(msk, -1)
             return torch.sum(seq * msk, 0) / torch.sum(msk)
 
-class Discriminator(nn.Module):
-    def __init__(self, n_h):
-        super(Discriminator, self).__init__()
-        self.f_k = nn.Bilinear(n_h, n_h, 1)
-        for m in self.modules():
-            self.weights_init(m)
 
-    def weights_init(self, m):
-        if isinstance(m, nn.Bilinear):
-            torch.nn.init.xavier_uniform_(m.weight.data)
-            if m.bias is not None:
-                m.bias.data.fill_(0.0)
-
-    def forward(self, c, h_pl, h_mi, s_bias1=None, s_bias2=None):
-        c_x = c.expand_as(h_pl)
-        sc_1 = self.f_k(h_pl, c_x)
-        sc_2 = self.f_k(h_mi, c_x)
-        if s_bias1 is not None:
-            sc_1 += s_bias1
-        if s_bias2 is not None:
-            sc_2 += s_bias2
-        logits = torch.cat((sc_1, sc_2), 1)
-        return logits
 
 # 统一的编码器基类与注册机制
 class BaseEncoder(nn.Module):
@@ -110,7 +107,26 @@ class GATEncoder(BaseEncoder):
         self.prelu2 = nn.PReLU(hidden2)
 
         self.mlp1 = nn.Linear(hidden2, hidden2)
-        self.disc = Discriminator(hidden2)
+        self.adv_head = nn.Linear(hidden2, hidden2)
+        proj_dim = getattr(self.args, 'proj_dim', hidden2)
+        num_views = int(getattr(self.args, 'num_views', 1) or 1)
+        if num_views <= 1:
+            self.moco = MoCoV2SingleView(base_dim=hidden2,
+                                         proj_dim=proj_dim,
+                                         K=getattr(self.args, 'moco_queue', 4096),
+                                         m=getattr(self.args, 'moco_momentum', 0.999),
+                                         T=getattr(self.args, 'moco_t', 0.2),
+                                         queue_warmup_steps=getattr(self.args, 'queue_warmup_steps', 0),
+                                         debug=bool(getattr(self.args, 'moco_debug', False)))
+        else:
+            self.moco = MoCoV2MultiView(base_dim=hidden2,
+                                        proj_dim=proj_dim,
+                                        num_views=num_views,
+                                        K=getattr(self.args, 'moco_queue', 4096),
+                                        m=getattr(self.args, 'moco_momentum', 0.999),
+                                        T=getattr(self.args, 'moco_t', 0.2),
+                                        queue_warmup_steps=getattr(self.args, 'queue_warmup_steps', 0),
+                                        debug=bool(getattr(self.args, 'moco_debug', False)))
         self.fusion = build_fusion_decoder(self.args, hidden2)
         self.dropout = dropout
 
@@ -124,6 +140,12 @@ class GATEncoder(BaseEncoder):
     def forward(self, data_o, data_a, idx):
         x_o, edge_index = data_o.x, data_o.edge_index
         x_a = data_a.x
+        # 接口一致性断言
+        _assert_tensor_2d(x_o, "GATEncoder.data_o.x")
+        _assert_tensor_2d(x_a, "GATEncoder.data_a.x")
+        _assert_edge_index(edge_index, "GATEncoder.edge_index")
+        if edge_index.device != x_o.device:
+            edge_index = edge_index.to(x_o.device)
 
         x2_o = self.encode(x_o, edge_index)
         x2_o_a = self.encode(x_a, edge_index)
@@ -136,13 +158,51 @@ class GATEncoder(BaseEncoder):
         h_os_a = self.sigm(h_os_a)
         h_os_a = self.mlp1(h_os_a)
 
-        ret_os = self.disc(h_os, x2_o, x2_o_a)
-        ret_os_a = self.disc(h_os_a, x2_o_a, x2_o)
+        # MoCo（单/多视图）
+        num_views = int(getattr(self.args, 'num_views', 1) or 1)
+        if num_views <= 1:
+            ret_os, ret_os_a = self.moco(x2_o, x2_o_a)
+        else:
+            # 构造多视图增强：第一视图沿用 data_a.x，其余从 data_o.x 生成
+            aug_name = getattr(self.args, "augment", "random_permute_features")
+            noise_std = float(getattr(self.args, "noise_std", 0.01) or 0.01)
+            mask_rate = float(getattr(self.args, "mask_rate", 0.1) or 0.1)
+            base_seed = getattr(self.args, "augment_seed", None)
+            if base_seed is None:
+                base_seed = int(getattr(self.args, "seed", 0))
+            # 将增强名规范为列表，便于按视图轮换
+            aug_list = list(aug_name) if isinstance(aug_name, (list, tuple)) else [aug_name]
+            try:
+                print(f"[MultiView-AUG] Using augmentations per view: {', '.join(map(str, aug_list))}")
+            except Exception:
+                pass
+            k_embeds = [x2_o_a]
+            for vid in range(1, num_views):
+                seed_v = base_seed + vid
+                aug_for_vid = aug_list[(vid - 1) % len(aug_list)]
+                x_aug = apply_augmentation(
+                    aug_for_vid,
+                    x_o,  # 直接传 tensor，避免CPU往返
+                    noise_std=noise_std,
+                    mask_rate=mask_rate,
+                    seed=seed_v
+                )
+                if not isinstance(x_aug, torch.Tensor):
+                    x_aug = torch.tensor(x_aug, dtype=x_o.dtype, device=x_o.device)
+                else:
+                    x_aug = x_aug.to(x_o.device)
+                # 注意：该编码器的编码函数为 encode(x, edge_index)
+                x2_aug = self.encode(x_aug, edge_index)
+                k_embeds.append(x2_aug)
+            ret_os, ret_os_a = self.moco(x2_o, k_embeds)
 
         entity1, entity2 = extract_entities(self.args, x2_o, idx)
         log, log1 = self.fusion(entity1, entity2)
 
-        logits = adversarial_logits(x2_o, x2_o_a, x2_o.shape[1])
+        # 持久化对抗头（避免每次前向新建层）
+        sc_1 = self.adv_head(x2_o).sum(1).unsqueeze(0)
+        sc_2 = self.adv_head(x2_o_a).sum(1).unsqueeze(0)
+        logits = torch.cat((sc_1, sc_2), 1)
 
         return log, ret_os, ret_os_a, x2_o, logits, log1
 
@@ -164,7 +224,22 @@ class GTEncoder(BaseEncoder):
         self.prelu2 = nn.PReLU(hidden2)
 
         self.mlp1 = nn.Linear(hidden2, hidden2)
-        self.disc = Discriminator(hidden2)
+        self.adv_head = nn.Linear(hidden2, hidden2)
+        proj_dim = getattr(self.args, 'proj_dim', hidden2)
+        num_views = int(getattr(self.args, 'num_views', 1) or 1)
+        if num_views <= 1:
+            self.moco = MoCoV2SingleView(base_dim=hidden2,
+                                         proj_dim=proj_dim,
+                                         K=getattr(self.args, 'moco_queue', 4096),
+                                         m=getattr(self.args, 'moco_momentum', 0.999),
+                                         T=getattr(self.args, 'moco_t', 0.2))
+        else:
+            self.moco = MoCoV2MultiView(base_dim=hidden2,
+                                        proj_dim=proj_dim,
+                                        num_views=num_views,
+                                        K=getattr(self.args, 'moco_queue', 4096),
+                                        m=getattr(self.args, 'moco_momentum', 0.999),
+                                        T=getattr(self.args, 'moco_t', 0.2))
         self.fusion = build_fusion_decoder(self.args, hidden2)
         self.dropout = dropout
 
@@ -178,6 +253,12 @@ class GTEncoder(BaseEncoder):
     def forward(self, data_o, data_a, idx):
         x_o, edge_index = data_o.x, data_o.edge_index
         x_a = data_a.x
+        # 接口一致性断言
+        _assert_tensor_2d(x_o, "GTEncoder.data_o.x")
+        _assert_tensor_2d(x_a, "GTEncoder.data_a.x")
+        _assert_edge_index(edge_index, "GTEncoder.edge_index")
+        if edge_index.device != x_o.device:
+            edge_index = edge_index.to(x_o.device)
 
         x2_o = self.encode(x_o, edge_index)
         x2_o_a = self.encode(x_a, edge_index)
@@ -190,13 +271,46 @@ class GTEncoder(BaseEncoder):
         h_os_a = self.sigm(h_os_a)
         h_os_a = self.mlp1(h_os_a)
 
-        ret_os = self.disc(h_os, x2_o, x2_o_a)
-        ret_os_a = self.disc(h_os_a, x2_o_a, x2_o)
+        num_views = int(getattr(self.args, 'num_views', 1) or 1)
+        if num_views <= 1:
+            ret_os, ret_os_a = self.moco(x2_o, x2_o_a)
+        else:
+            aug_name = getattr(self.args, "augment", "random_permute_features")
+            noise_std = float(getattr(self.args, "noise_std", 0.01) or 0.01)
+            mask_rate = float(getattr(self.args, "mask_rate", 0.1) or 0.1)
+            base_seed = getattr(self.args, "augment_seed", None)
+            if base_seed is None:
+                base_seed = int(getattr(self.args, "seed", 0))
+            aug_list = list(aug_name) if isinstance(aug_name, (list, tuple)) else [aug_name]
+            try:
+                print(f"[MultiView-AUG] Using augmentations per view: {', '.join(map(str, aug_list))}")
+            except Exception:
+                pass
+            k_embeds = [x2_o_a]
+            for vid in range(1, num_views):
+                seed_v = base_seed + vid
+                aug_for_vid = aug_list[(vid - 1) % len(aug_list)]
+                x_aug = apply_augmentation(
+                    aug_for_vid,
+                    x_o,  # 直接传 tensor
+                    noise_std=noise_std,
+                    mask_rate=mask_rate,
+                    seed=seed_v
+                )
+                if not isinstance(x_aug, torch.Tensor):
+                    x_aug = torch.tensor(x_aug, dtype=x_o.dtype, device=x_o.device)
+                else:
+                    x_aug = x_aug.to(x_o.device)
+                x2_aug = self.encode(x_aug, edge_index)
+                k_embeds.append(x2_aug)
+            ret_os, ret_os_a = self.moco(x2_o, k_embeds)
 
         entity1, entity2 = extract_entities(self.args, x2_o, idx)
         log, log1 = self.fusion(entity1, entity2)
 
-        logits = adversarial_logits(x2_o, x2_o_a, x2_o.shape[1])
+        sc_1 = self.adv_head(x2_o).sum(1).unsqueeze(0)
+        sc_2 = self.adv_head(x2_o_a).sum(1).unsqueeze(0)
+        logits = torch.cat((sc_1, sc_2), 1)
 
         return log, ret_os, ret_os_a, x2_o, logits, log1
 
@@ -219,7 +333,22 @@ class GATGTSerial(BaseEncoder):
         self.prelu_t2 = nn.PReLU(hidden2)
 
         self.mlp1 = nn.Linear(hidden2, hidden2)
-        self.disc = Discriminator(hidden2)
+        self.adv_head = nn.Linear(hidden2, hidden2)
+        proj_dim = getattr(self.args, 'proj_dim', hidden2)
+        num_views = int(getattr(self.args, 'num_views', 1) or 1)
+        if num_views <= 1:
+            self.moco = MoCoV2SingleView(base_dim=hidden2,
+                                         proj_dim=proj_dim,
+                                         K=getattr(self.args, 'moco_queue', 4096),
+                                         m=getattr(self.args, 'moco_momentum', 0.999),
+                                         T=getattr(self.args, 'moco_t', 0.2))
+        else:
+            self.moco = MoCoV2MultiView(base_dim=hidden2,
+                                        proj_dim=proj_dim,
+                                        num_views=num_views,
+                                        K=getattr(self.args, 'moco_queue', 4096),
+                                        m=getattr(self.args, 'moco_momentum', 0.999),
+                                        T=getattr(self.args, 'moco_t', 0.2))
         self.fusion = build_fusion_decoder(self.args, hidden2)
         self.dropout = dropout
 
@@ -233,6 +362,12 @@ class GATGTSerial(BaseEncoder):
     def forward(self, data_o, data_a, idx):
         x_o, edge_index = data_o.x, data_o.edge_index
         x_a = data_a.x
+        # 接口一致性断言
+        _assert_tensor_2d(x_o, "GATGTSerial.data_o.x")
+        _assert_tensor_2d(x_a, "GATGTSerial.data_a.x")
+        _assert_edge_index(edge_index, "GATGTSerial.edge_index")
+        if edge_index.device != x_o.device:
+            edge_index = edge_index.to(x_o.device)
 
         x2_o = self.encode(x_o, edge_index)
         x2_o_a = self.encode(x_a, edge_index)
@@ -245,13 +380,46 @@ class GATGTSerial(BaseEncoder):
         h_os_a = self.sigm(h_os_a)
         h_os_a = self.mlp1(h_os_a)
 
-        ret_os = self.disc(h_os, x2_o, x2_o_a)
-        ret_os_a = self.disc(h_os_a, x2_o_a, x2_o)
+        num_views = int(getattr(self.args, 'num_views', 1) or 1)
+        if num_views <= 1:
+            ret_os, ret_os_a = self.moco(x2_o, x2_o_a)
+        else:
+            aug_name = getattr(self.args, "augment", "random_permute_features")
+            noise_std = float(getattr(self.args, "noise_std", 0.01) or 0.01)
+            mask_rate = float(getattr(self.args, "mask_rate", 0.1) or 0.1)
+            base_seed = getattr(self.args, "augment_seed", None)
+            if base_seed is None:
+                base_seed = int(getattr(self.args, "seed", 0))
+            aug_list = list(aug_name) if isinstance(aug_name, (list, tuple)) else [aug_name]
+            try:
+                print(f"[MultiView-AUG] Using augmentations per view: {', '.join(map(str, aug_list))}")
+            except Exception:
+                pass
+            k_embeds = [x2_o_a]
+            for vid in range(1, num_views):
+                seed_v = base_seed + vid
+                aug_for_vid = aug_list[(vid - 1) % len(aug_list)]
+                x_aug = apply_augmentation(
+                    aug_for_vid,
+                    x_o,  # 直接传 tensor
+                    noise_std=noise_std,
+                    mask_rate=mask_rate,
+                    seed=seed_v
+                )
+                if not isinstance(x_aug, torch.Tensor):
+                    x_aug = torch.tensor(x_aug, dtype=x_o.dtype, device=x_o.device)
+                else:
+                    x_aug = x_aug.to(x_o.device)
+                x2_aug = self.encode(x_aug, edge_index)
+                k_embeds.append(x2_aug)
+            ret_os, ret_os_a = self.moco(x2_o, k_embeds)
 
         entity1, entity2 = extract_entities(self.args, x2_o, idx)
         log, log1 = self.fusion(entity1, entity2)
 
-        logits = adversarial_logits(x2_o, x2_o_a, x2_o.shape[1])
+        sc_1 = self.adv_head(x2_o).sum(1).unsqueeze(0)
+        sc_2 = self.adv_head(x2_o_a).sum(1).unsqueeze(0)
+        logits = torch.cat((sc_1, sc_2), 1)
 
         return log, ret_os, ret_os_a, x2_o, logits, log1
 
@@ -281,7 +449,13 @@ class GATGTParallel(BaseEncoder):
         self.fuse = nn.Linear(hidden2 * 2, hidden2)
 
         self.mlp1 = nn.Linear(hidden2, hidden2)
-        self.disc = Discriminator(hidden2)
+        self.adv_head = nn.Linear(hidden2, hidden2)
+        proj_dim = getattr(self.args, 'proj_dim', hidden2)
+        self.moco = MoCoV2SingleView(base_dim=hidden2,
+                                     proj_dim=proj_dim,
+                                     K=getattr(self.args, 'moco_queue', 4096),
+                                     m=getattr(self.args, 'moco_momentum', 0.999),
+                                     T=getattr(self.args, 'moco_t', 0.2))
         self.fusion = build_fusion_decoder(self.args, hidden2)
         self.dropout = dropout
 
@@ -302,6 +476,12 @@ class GATGTParallel(BaseEncoder):
     def forward(self, data_o, data_a, idx):
         x_o, edge_index = data_o.x, data_o.edge_index
         x_a = data_a.x
+        # 接口一致性断言
+        _assert_tensor_2d(x_o, "GATGTParallel.data_o.x")
+        _assert_tensor_2d(x_a, "GATGTParallel.data_a.x")
+        _assert_edge_index(edge_index, "GATGTParallel.edge_index")
+        if edge_index.device != x_o.device:
+            edge_index = edge_index.to(x_o.device)
 
         gat_o = self.branch_gat(x_o, edge_index)
         gt_o = self.branch_gt(x_o, edge_index)
@@ -319,13 +499,14 @@ class GATGTParallel(BaseEncoder):
         h_os_a = self.sigm(h_os_a)
         h_os_a = self.mlp1(h_os_a)
 
-        ret_os = self.disc(h_os, x2_o, x2_o_a)
-        ret_os_a = self.disc(h_os_a, x2_o_a, x2_o)
+        ret_os, ret_os_a = self.moco(x2_o, x2_o_a)
 
         entity1, entity2 = extract_entities(self.args, x2_o, idx)
         log, log1 = self.fusion(entity1, entity2)
 
-        logits = adversarial_logits(x2_o, x2_o_a, x2_o.shape[1])
+        sc_1 = self.adv_head(x2_o).sum(1).unsqueeze(0)
+        sc_2 = self.adv_head(x2_o_a).sum(1).unsqueeze(0)
+        logits = torch.cat((sc_1, sc_2), 1)
 
         return log, ret_os, ret_os_a, x2_o, logits, log1
 
@@ -361,7 +542,22 @@ class MGACMDAAdapter(BaseEncoder):
         self.encoder = _InternalGraphAttentionEncoder(in_dim=in_dim, hidden_dims=[hidden1, hidden2], num_heads=num_heads, fc=None)
 
         self.mlp1 = nn.Linear(hidden2, hidden2)
-        self.disc = Discriminator(hidden2)
+        self.adv_head = nn.Linear(hidden2, hidden2)
+        proj_dim = getattr(self.args, 'proj_dim', hidden2)
+        num_views = int(getattr(self.args, 'num_views', 1) or 1)
+        if num_views <= 1:
+            self.moco = MoCoV2SingleView(base_dim=hidden2,
+                                         proj_dim=proj_dim,
+                                         K=getattr(self.args, 'moco_queue', 4096),
+                                         m=getattr(self.args, 'moco_momentum', 0.999),
+                                         T=getattr(self.args, 'moco_t', 0.2))
+        else:
+            self.moco = MoCoV2MultiView(base_dim=hidden2,
+                                        proj_dim=proj_dim,
+                                        num_views=num_views,
+                                        K=getattr(self.args, 'moco_queue', 4096),
+                                        m=getattr(self.args, 'moco_momentum', 0.999),
+                                        T=getattr(self.args, 'moco_t', 0.2))
         self.fusion = build_fusion_decoder(self.args, hidden2)
         self.dropout = getattr(args, 'dropout', 0.1)
 
@@ -374,9 +570,20 @@ class MGACMDAAdapter(BaseEncoder):
         x_o, edge_index = data_o.x, data_o.edge_index
         x_a = data_a.x
         n = x_o.size(0)
+        # 接口一致性断言
+        _assert_tensor_2d(x_o, "MGACMDAAdapter.data_o.x")
+        _assert_tensor_2d(x_a, "MGACMDAAdapter.data_a.x")
+        _assert_edge_index(edge_index, "MGACMDAAdapter.edge_index")
 
         A_o = self.edge_index_to_dense_adj(edge_index, n)
         A_a = A_o
+        _assert_dense_adj(A_o, n, "MGACMDAAdapter.A_o")
+        if A_o.device != x_o.device:
+            A_o = A_o.to(x_o.device)
+            A_a = A_o
+        if not torch.is_floating_point(x_o):
+            x_o = x_o.float()
+            x_a = x_a.float()
 
         x2_o = self.encoder(A_o, x_o)
         x2_o_a = self.encoder(A_a, x_a)
@@ -384,13 +591,47 @@ class MGACMDAAdapter(BaseEncoder):
         h_os = self.read(x2_o); h_os = self.sigm(h_os); h_os = self.mlp1(h_os)
         h_os_a = self.read(x2_o_a); h_os_a = self.sigm(h_os_a); h_os_a = self.mlp1(h_os_a)
 
-        ret_os = self.disc(h_os, x2_o, x2_o_a)
-        ret_os_a = self.disc(h_os_a, x2_o_a, x2_o)
+        num_views = int(getattr(self.args, 'num_views', 1) or 1)
+        if num_views <= 1:
+            ret_os, ret_os_a = self.moco(x2_o, x2_o_a)
+        else:
+            aug_name = getattr(self.args, "augment", "random_permute_features")
+            noise_std = float(getattr(self.args, "noise_std", 0.01) or 0.01)
+            mask_rate = float(getattr(self.args, "mask_rate", 0.1) or 0.1)
+            base_seed = getattr(self.args, "augment_seed", None)
+            if base_seed is None:
+                base_seed = int(getattr(self.args, "seed", 0))
+            aug_list = list(aug_name) if isinstance(aug_name, (list, tuple)) else [aug_name]
+            try:
+                print(f"[MultiView-AUG] Using augmentations per view: {', '.join(map(str, aug_list))}")
+            except Exception:
+                pass
+            k_embeds = [x2_o_a]
+            for vid in range(1, num_views):
+                seed_v = base_seed + vid
+                aug_for_vid = aug_list[(vid - 1) % len(aug_list)]
+                x_aug = apply_augmentation(
+                    aug_for_vid,
+                    x_o,  # 直接传 tensor
+                    noise_std=noise_std,
+                    mask_rate=mask_rate,
+                    seed=seed_v
+                )
+                if not isinstance(x_aug, torch.Tensor):
+                    x_aug = torch.tensor(x_aug, dtype=x_o.dtype, device=x_o.device)
+                else:
+                    x_aug = x_aug.to(x_o.device)
+                # MGACMDA 使用 self.encoder(A, X)
+                x2_aug = self.encoder(A_o, x_aug)
+                k_embeds.append(x2_aug)
+            ret_os, ret_os_a = self.moco(x2_o, k_embeds)
 
         entity1, entity2 = extract_entities(self.args, x2_o, idx)
         log, log1 = self.fusion(entity1, entity2)
 
-        logits = adversarial_logits(x2_o, x2_o_a, x2_o.shape[1])
+        sc_1 = self.adv_head(x2_o).sum(1).unsqueeze(0)
+        sc_2 = self.adv_head(x2_o_a).sum(1).unsqueeze(0)
+        logits = torch.cat((sc_1, sc_2), 1)
         return log, ret_os, ret_os_a, x2_o, logits, log1
 
 # 内置版 GraphAttentionEncoder（参考 MGACMDA/gate.py）

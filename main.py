@@ -151,6 +151,31 @@ torch.manual_seed(args.seed)  # 为PyTorch在CPU上的操作设置随机种子�
 if args.cuda:  # 如果确定使用CUDA
     torch.cuda.manual_seed(args.seed)  # 也为PyTorch在GPU上的操作设置随机种子
 
+# 打印增强配置汇总
+try:
+    _aug = getattr(args, "augment", "random_permute_features")
+    _mode = getattr(args, "augment_mode", "static") if hasattr(args, "augment_mode") else "static"
+    _noise = getattr(args, "noise_std", 0.01)
+    _mask = getattr(args, "mask_rate", 0.1)
+    _aseed = getattr(args, "augment_seed", None)
+    logger.info("=== Augmentation Config ===")
+    try:
+        _aug_str = ",".join(_aug) if isinstance(_aug, (list, tuple)) else str(_aug)
+    except Exception:
+        _aug_str = str(_aug)
+    # 额外的人类可读提示：单/多增强
+    try:
+        if isinstance(_aug, (list, tuple)):
+            print(f"[AUG CONFIG] Multiple augmentations detected: {', '.join(map(str, _aug))}")
+        else:
+            print(f"[AUG CONFIG] Single augmentation: {_aug}")
+    except Exception:
+        pass
+    logger.info(f"augment={_aug_str} | mode={_mode} | noise_std={_noise} | mask_rate={_mask} | augment_seed={_aseed} (None means seed+fold for static)")
+    logger.info("===========================")
+except Exception as _e:
+    logger.info(f"[AUGMENT] config print skipped due to: {_e}")
+
 
 # load data  # 注释：加载数据
 # 调用load_data函数，传入参数对象args
