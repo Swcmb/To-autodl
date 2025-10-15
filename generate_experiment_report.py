@@ -15,10 +15,10 @@ REPORT_MD = os.path.join("EM", "test.md")
 ASSET_DIR = os.path.join(RESULT_ROOT, "_report_assets")
 
 # 参数空间默认值（满足题述要求）
-DEFAULT_FEATURE_TYPES = ['one_hot', 'uniform', 'normal', 'position']  # one_hot|uniform|normal|position
+DEFAULT_FEATURE_TYPES = ['one_hot']  # one_hot|uniform|normal|position
 DEFAULT_AUGMENTS = ['none', 'random_permute_features', 'add_noise', 'attribute_mask', 'noise_then_mask']  # none|random_permute_features|add_noise|attribute_mask|noise_then_mask
-DEFAULT_AUGMENT_MODES = ['static', 'online']  # static|online
-DEFAULT_ENCODER_TYPES = ['csglmd','mgacmda','gat','gt','gat_gt_serial','gat_gt_parallel']  # csglmd|csglmd_main|mgacmda|gat|gt|gat_gt_serial|gat_gt_parallel
+DEFAULT_AUGMENT_MODES = ['static',]  # static|online
+DEFAULT_ENCODER_TYPES = ['gat','gt','gat_gt_serial','gat_gt_parallel']  # csglmd|csglmd_main|mgacmda|gat|gt|gat_gt_serial|gat_gt_parallel
 DEFAULT_FUSION_TYPES = ['basic','dot','additive','self_attn','gat_fusion','gt_fusion']  # basic|dot|additive|self_attn|gat_fusion|gt_fusion
 DEFAULT_QUEUE_WARMUPS = [5]  # int
 
