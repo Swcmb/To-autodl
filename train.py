@@ -2,14 +2,16 @@ import torch  # 导入PyTorch主库
 import numpy as np  # 导入NumPy库，用于数值运算
 import torch.nn as nn  # 导入PyTorch的神经网络模块
 import matplotlib.pyplot as plt  # 导入matplotlib的绘图库（在此文件中未使用）
-from sklearn.metrics import precision_recall_curve, roc_auc_score, roc_curve, average_precision_score, f1_score, auc  # 从scikit-learn导入各种评估指标函数
+from sklearn.metrics import precision_recall_curve, roc_auc_score, roc_curve, average_precision_score, f1_score, auc, precision_score, recall_score, confusion_matrix  # 从scikit-learn导入各种评估指标函数
 from log_output_manager import get_logger
 from enhance import apply_augmentation
 from torch_geometric.data import Data
 # 使用 main.py 的 redirect_print 统一重定向输出，无需在此处绑定 logger
 
 
-def train_model(model, optimizer, data_o, data_a, train_loader, test_loader, args):  # 定义主训练函数
+from log_output_manager import get_logger, save_result_text, get_run_paths
+
+def train_model(model, optimizer, data_o, data_a, train_loader, test_loader, args, fold_idx=None):  # 定义主训练函数，增加fold索引
     m = torch.nn.Sigmoid()  # 实例化Sigmoid函数，用于将模型输出转换为概率
     loss_fct = torch.nn.BCELoss()  # 实例化二元交叉熵损失函数（用于主任务）
     b_xent = nn.BCEWithLogitsLoss()  # 实例化带Logits的二元交叉熵损失，更稳定（用于对比和对抗损失）
@@ -26,6 +28,7 @@ def train_model(model, optimizer, data_o, data_a, train_loader, test_loader, arg
     aug_name = getattr(args, 'augment', 'random_permute_features')
     # 若传入多种增强，在线增强仅取第一个，保持稳定
     aug_online = aug_name[0] if isinstance(aug_name, (list, tuple)) and len(aug_name) > 0 else aug_name
+    aug_online = str(aug_online)  # 统一为字符串，消除类型检查告警
     noise_std = float(getattr(args, 'noise_std', 0.01) or 0.01)
     mask_rate = float(getattr(args, 'mask_rate', 0.1) or 0.1)
     base_seed = getattr(args, 'augment_seed', None)
@@ -35,12 +38,18 @@ def train_model(model, optimizer, data_o, data_a, train_loader, test_loader, arg
     # Train model  # 注释：训练模型
     lbl = data_a.y  # 获取对抗数据的标签（用于对比学习）
     print('Start Training...')  # 打印开始训练的信息
+    # 记录每个epoch的训练指标（便于保存）
+    epoch_metrics = []  # 每项为 dict：{'epoch':i, 'auroc':.., 'auprc':.., 'precision':.., 'recall':.., 'f1':.., 'cm':(tn,fp,fn,tp)}
 
     for epoch in range(args.epochs):  # 开始按设定的轮数进行训练循环
         print('-------- Epoch ' + str(epoch + 1) + ' --------')  # 打印当前轮数
         y_pred_train = []  # 初始化列表，用于存储当前轮次的预测值
         y_label_train = []  # 初始化列表，用于存储当前轮次的真实标签
         loss_train = torch.tensor(0.0) # 初始化训练损失，防止在训练加载器为空时引用错误
+        # 初始化分项损失，避免空训练集时报未绑定
+        loss1 = torch.tensor(0.0, device=device)
+        loss2 = torch.tensor(0.0, device=device)
+        loss3 = torch.tensor(0.0, device=device)
 
         # 为节点级别的对抗损失创建标签（动态节点数 + 设备对齐）
         n_nodes = int(data_o.x.size(0))
@@ -82,17 +91,19 @@ def train_model(model, optimizer, data_o, data_a, train_loader, test_loader, arg
 
             log = torch.squeeze(m(output))  # 对主任务输出应用Sigmoid并压缩维度
             loss1 = loss_fct(log, label.float())  # 计算主任务的二元交叉熵损失
-            # MoCo：支持单/多视图
-            if isinstance(cla_os, (list, tuple)):
-                losses = [ce_loss(lg, tg) for lg, tg in zip(cla_os, cla_os_a)]
-                loss2 = torch.stack(losses).mean()
+            # MoCo：支持单/多视图；当 alpha=0 时跳过计算以隔离监督路径
+            if float(getattr(args, "loss_ratio2", 0.0) or 0.0) > 0.0:
+                if isinstance(cla_os, (list, tuple)):
+                    losses = [ce_loss(lg, tg) for lg, tg in zip(cla_os, cla_os_a)]
+                    loss2 = torch.stack(losses).mean()
+                else:
+                    loss2 = ce_loss(cla_os, cla_os_a)
             else:
-                loss2 = ce_loss(cla_os, cla_os_a)
-            loss3 = torch.tensor(0.0, device=(cla_os[0].device if isinstance(cla_os, (list, tuple)) else cla_os.device))
-            loss4 = node_loss(logits, lbl2.float())  # 计算节点级别的对抗损失
-            # 根据预设的权重，将四个损失加权求和得到总损失
-            loss_train = args.loss_ratio1 * loss1 + args.loss_ratio2 * loss2 + args.loss_ratio3 * loss3 \
-                         + args.loss_ratio4 * loss4
+                loss2 = torch.tensor(0.0, device=device)
+            # 节点级对抗损失改为 loss_ratio3 对应
+            loss3 = node_loss(logits, lbl2.float())
+            # 总损失仅使用 1:监督、2:对比、3:节点对抗
+            loss_train = args.loss_ratio1 * loss1 + args.loss_ratio2 * loss2 + args.loss_ratio3 * loss3
             # print("loss_train: ",loss_train)  # 被注释掉的调试语句
 
             loss_history.append(loss_train.item())  # 记录当前批次的总损失
@@ -106,29 +117,99 @@ def train_model(model, optimizer, data_o, data_a, train_loader, test_loader, arg
             if i % 100 == 0:  # 每100个批次
                 # 打印当前轮次、迭代次数和训练损失（含分项：task/contrastive/adversarial）
                 print('epoch: ' + str(epoch + 1) + '/ iteration: ' + str(i + 1) + '/ loss_train: ' + str(
-                    loss_train.cpu().detach().numpy()) + ' | task_loss:' + format(loss1.item(), '.4f') + ' cont_loss:' + format(loss2.item(), '.4f') + ' adv_loss:' + format(loss4.item(), '.4f'))
+                    loss_train.cpu().detach().numpy()) + ' | task_loss:' + format(loss1.item(), '.4f') + ' cont_loss:' + format(loss2.item(), '.4f') + ' adv_loss:' + format(loss3.item(), '.4f'))
 
-        # 在训练集非空时计算AUROC，否则为0，避免程序出错
-        roc_train = roc_auc_score(y_label_train, y_pred_train) if y_label_train else 0.0
+        # 在训练集非空时计算各项指标，否则默认0，避免程序出错
+        if y_label_train:
+            roc_train = roc_auc_score(y_label_train, y_pred_train)
+            auprc_train = average_precision_score(y_label_train, y_pred_train)
+            outputs_train = np.asarray((np.asarray(y_pred_train) >= 0.5).astype(int))
+            precision_train = precision_score(y_label_train, outputs_train, zero_division="warn")
+            recall_train = recall_score(y_label_train, outputs_train, zero_division="warn")
+            f1_train = f1_score(y_label_train, outputs_train, zero_division="warn")
+            tn, fp, fn, tp = confusion_matrix(y_label_train, outputs_train).ravel()
+        else:
+            roc_train = 0.0
+            auprc_train = 0.0
+            precision_train = 0.0
+            recall_train = 0.0
+            f1_train = 0.0
+            tn = fp = fn = tp = 0
+
+        # 保存到本地列表以便写入CSV
+        epoch_metrics.append({
+            'epoch': epoch + 1,
+            'auroc': roc_train,
+            'auprc': auprc_train,
+            'precision': precision_train,
+            'recall': recall_train,
+            'f1': f1_train,
+            'cm': (tn, fp, fn, tp),
+            'task_loss': float(loss1.item()),
+            'cont_loss': float(loss2.item()),
+            'adv_loss': float(loss3.item()),
+            'loss_train': float(loss_train.item())
+        })
 
         # 打印当前轮次的总结信息
         print('epoch: {:04d}'.format(epoch + 1),'loss_train: {:.4f}'.format(loss_train.item()),
                 'task_loss: {:.4f}'.format(loss1.item()), 'cont_loss: {:.4f}'.format(loss2.item()),
-                'adv_loss: {:.4f}'.format(loss4.item()), 'auroc_train: {:.4f}'.format(roc_train))
+                'adv_loss: {:.4f}'.format(loss3.item()), 'auroc_train: {:.4f}'.format(roc_train),
+                'auprc_train: {:.4f}'.format(auprc_train), 'precision_train: {:.4f}'.format(precision_train),
+                'recall_train: {:.4f}'.format(recall_train), 'f1_train: {:.4f}'.format(f1_train),
+                f'cm_train: (tn={tn}, fp={fp}, fn={fn}, tp={tp})')
 
         if hasattr(torch.cuda, 'empty_cache'):  # 如果PyTorch版本支持
             torch.cuda.empty_cache()  # 清空GPU缓存，释放不必要的显存
     print("Optimization Finished!")  # 所有轮次训练完成后，打印优化完成
 
+    # 将每epoch训练指标写入 EM/result 当前运行目录下的CSV
+    try:
+        run_id = (get_run_paths().get('run_id') or '')
+        fold_tag = f"fold_{fold_idx}" if fold_idx is not None else "fold"
+        fname = f"train_epoch_metrics_{fold_tag}_{run_id}.csv" if run_id else f"train_epoch_metrics_{fold_tag}.csv"
+        # 构造CSV文本
+        lines = ["epoch,loss_train,task_loss,cont_loss,adv_loss,auroc,auprc,precision,recall,f1,tn,fp,fn,tp"]
+        for em in epoch_metrics:
+            tn, fp, fn, tp = em['cm']
+            lines.append("{epoch},{loss:.6f},{tl:.6f},{cl:.6f},{al:.6f},{auc:.6f},{auprc:.6f},{prec:.6f},{rec:.6f},{f1:.6f},{tn},{fp},{fn},{tp}".format(
+                epoch=em['epoch'],
+                loss=em['loss_train'],
+                tl=em['task_loss'],
+                cl=em['cont_loss'],
+                al=em['adv_loss'],
+                auc=em['auroc'],
+                auprc=em['auprc'],
+                prec=em['precision'],
+                rec=em['recall'],
+                f1=em['f1'],
+                tn=tn, fp=fp, fn=fn, tp=tp
+            ))
+        save_result_text("\n".join(lines), filename=fname, subdir="metrics")
+        print(f"[SAVE] Per-epoch train metrics saved: {fname}")
+    except Exception as _e:
+        print(f"[SAVE] Failed to write per-epoch metrics: {_e}")
+
     # Testing  # 注释：测试阶段
     # 调用test函数，在测试集上评估最终模型
-    auroc_test, prc_test, f1_test, loss_test = test(model, test_loader, data_o, data_a, args)
+    auroc_test, prc_test, precision_test, recall_test, f1_test, loss_test, cm_test = test(model, test_loader, data_o, data_a, args)
+    tn_t, fp_t, fn_t, tp_t = cm_test
     # 打印测试集上的各项性能指标
     print('loss_test: {:.4f}'.format(loss_test.item()), 'auroc_test: {:.4f}'.format(auroc_test),
-          'auprc_test: {:.4f}'.format(prc_test), 'f1_test: {:.4f}'.format(f1_test))
+          'auprc_test: {:.4f}'.format(prc_test), 'precision_test: {:.4f}'.format(precision_test),
+          'recall_test: {:.4f}'.format(recall_test), 'f1_test: {:.4f}'.format(f1_test),
+          f'cm_test: (tn={tn_t}, fp={fp_t}, fn={fn_t}, tp={tp_t})')
     
-    # 返回测试结果
-    return {'auroc': auroc_test, 'auprc': prc_test, 'f1': f1_test, 'loss': loss_test.item()}
+    # 返回测试结果（含混淆矩阵）
+    return {
+        'auroc': auroc_test,
+        'auprc': prc_test,
+        'precision': precision_test,
+        'recall': recall_test,
+        'f1': f1_test,
+        'loss': loss_test.item(),
+        'cm': (int(tn_t), int(fp_t), int(fn_t), int(tp_t))
+    }
 
 
 def test(model, loader, data_o, data_a, args):  # 定义测试函数
@@ -165,15 +246,17 @@ def test(model, loader, data_o, data_a, args):  # 定义测试函数
 
             # 计算测试集上的损失（尽管在测试阶段通常更关心指标而非损失值）
             loss1 = loss_fct(log, label.float())
-            if isinstance(cla_os, (list, tuple)):
-                losses = [ce_loss(lg, tg) for lg, tg in zip(cla_os, cla_os_a)]
-                loss2 = torch.stack(losses).mean()
+            if float(getattr(args, "loss_ratio2", 0.0) or 0.0) > 0.0:
+                if isinstance(cla_os, (list, tuple)):
+                    losses = [ce_loss(lg, tg) for lg, tg in zip(cla_os, cla_os_a)]
+                    loss2 = torch.stack(losses).mean()
+                else:
+                    loss2 = ce_loss(cla_os, cla_os_a)
             else:
-                loss2 = ce_loss(cla_os, cla_os_a)
-            loss3 = torch.tensor(0.0, device=(cla_os[0].device if isinstance(cla_os, (list, tuple)) else cla_os.device))
-            loss4 = node_loss(logits, lbl2.float())
-            loss = args.loss_ratio1 * loss1 + args.loss_ratio2 * loss2 + args.loss_ratio3 * loss3 \
-                   + args.loss_ratio4 * loss4
+                loss2 = torch.tensor(0.0, device=device)
+            # 节点级对抗损失改为 loss_ratio3 对应
+            loss3 = node_loss(logits, lbl2.float())
+            loss = args.loss_ratio1 * loss1 + args.loss_ratio2 * loss2 + args.loss_ratio3 * loss3
 
             label_ids = label.to('cpu').numpy()  # 将标签移回CPU
             y_label = y_label + label_ids.flatten().tolist()  # 收集真实标签
@@ -181,10 +264,19 @@ def test(model, loader, data_o, data_a, args):  # 定义测试函数
     
     # 如果测试集为空，则返回0，避免程序崩溃
     if not y_label:
-        return 0.0, 0.0, 0.0, loss
+        # 与正常分支保持一致返回项数：auroc, auprc, precision, recall, f1, loss, cm
+        return 0.0, 0.0, 0.0, 0.0, 0.0, loss, (0, 0, 0, 0)
 
     # 在循环结束后，根据所有批次的预测概率计算硬预测（0或1）
     outputs = np.asarray([1 if i else 0 for i in (np.asarray(y_pred) >= 0.5)])
 
-    # 计算并返回测试集上的AUROC, AUPRC, F1分数和平均损失
-    return roc_auc_score(y_label, y_pred), average_precision_score(y_label, y_pred), f1_score(y_label, outputs), loss
+    # 计算全量测试指标
+    auroc = roc_auc_score(y_label, y_pred)
+    auprc = average_precision_score(y_label, y_pred)
+    precision = precision_score(y_label, outputs, zero_division="warn")
+    recall = recall_score(y_label, outputs, zero_division="warn")
+    f1 = f1_score(y_label, outputs, zero_division="warn")
+    tn, fp, fn, tp = confusion_matrix(y_label, outputs).ravel()
+
+    # 返回测试集上的 AUROC, AUPRC, Precision, Recall, F1, 平均损失 与 混淆矩阵
+    return auroc, auprc, precision, recall, f1, loss, (int(tn), int(fp), int(fn), int(tp))

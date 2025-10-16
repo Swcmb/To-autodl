@@ -85,9 +85,7 @@ def settings():  # 定义一个名为settings的函数，用于设置和返回�
     parser.add_argument('--loss_ratio3', type=float, default=0.5,
                         help='Ratio of task3. Default is 0.5')
 
-    # 添加'--loss_ratio4'参数，设置第四个损失函数（对抗损失）的权重
-    parser.add_argument('--loss_ratio4', type=float, default=0.5,
-                        help='Ratio of task4. Default is 0.5')
+
 
     # model parameter setting  # 注释：模型参数设置
     # 添加'--dimensions'参数，设置节点初始特征的维度
@@ -134,6 +132,10 @@ def settings():  # 定义一个名为settings的函数，用于设置和返回�
                         help='MoCo temperature T. Default 0.2.')
     parser.add_argument('--proj_dim', type=int, default=None,
                         help='Projection dimension. Default follows hidden2.')
+    # 对比学习类型开关：EM 判别器 或 MoCo v2（单/多视图）
+    parser.add_argument('--contrastive_type', type=str, default='em',
+                        choices=['em', 'moco_single', 'moco_multi'],
+                        help='Contrastive learning type: em (bilinear discriminator), moco_single (single-view MoCo v2), or moco_multi (multi-view MoCo v2). Default em.')
     parser.add_argument('--num_views', type=int, default=1,
                         help='Number of augmented views for MoCo (start with 1).')
     parser.add_argument('--queue_warmup_steps', type=int, default=0,
@@ -157,12 +159,13 @@ def settings():  # 定义一个名为settings的函数，用于设置和返回�
                         help='Similarity threshold for graph construction. Default is 0.5.')
     
     # 添加多任务学习的权重参数别名
-    parser.add_argument('--alpha', dest='loss_ratio2', type=float, default=0.5,
-                        help='Weight for contrastive learning task. Alias for --loss_ratio2.')
-    parser.add_argument('--beta', dest='loss_ratio3', type=float, default=0.5,
-                        help='Weight for second contrastive learning task. Alias for --loss_ratio3.')
-    parser.add_argument('--gamma', dest='loss_ratio4', type=float, default=0.5,
-                        help='Weight for adversarial learning task. Alias for --loss_ratio4.')
+    # 别名重映射：alpha=监督、beta=对比、gamma=节点对抗
+    parser.add_argument('--alpha', dest='loss_ratio1', type=float, default=1.0,
+                        help='Weight for supervised task (BCE). Alias for --loss_ratio1.')
+    parser.add_argument('--beta', dest='loss_ratio2', type=float, default=0.5,
+                        help='Weight for contrastive task (InfoNCE/CE). Alias for --loss_ratio2.')
+    parser.add_argument('--gamma', dest='loss_ratio3', type=float, default=0.5,
+                        help='Weight for node adversarial task (BCEWithLogits). Alias for --loss_ratio3.')
 
     # 保存与折数相关参数（主程序接入）
     parser.add_argument('--save_datasets', type=lambda x: str(x).lower() == 'true', default=True,

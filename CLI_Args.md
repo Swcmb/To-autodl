@@ -62,14 +62,15 @@
 - `--epochs` [int]，默认 `1`
 
 ## 5. 多任务损失与别名
-- `--loss_ratio1` [float]，默认 `1.0`（主任务 BCE）
-- `--loss_ratio2` [float]，默认 `0.5`（对比 InfoNCE/CE）
-- `--loss_ratio3` [float]，默认 `0.5`（第二对比，当前实现置 `0`）
-- `--loss_ratio4` [float]，默认 `0.5`（节点级对抗 `BCEWithLogits`）
+- `--loss_ratio1` [float]，默认 `1.0`（监督任务 BCE）
+- `--loss_ratio2` [float]，默认 `0.5`（对比学习 InfoNCE/CE）
+- `--loss_ratio3` [float]，默认 `0.5`（节点级对抗 `BCEWithLogits`）
+
 - 别名：
-  - `--alpha` → `loss_ratio2`（默认 `0.5`）
-  - `--beta` → `loss_ratio3`（默认 `0.5`）
-  - `--gamma` → `loss_ratio4`（默认 `0.5`）
+  - `--alpha` → `loss_ratio1`（监督 BCE）
+  - `--beta` → `loss_ratio2`（对比 InfoNCE/CE）
+  - `--gamma` → `loss_ratio3`（节点对抗 BCEWithLogits）
+
 
 ## 6. 模型与编码器
 - `--dimensions` / `--embed_dim` [int]，默认 `256`（LMI 任务可用 `512`）
@@ -92,6 +93,22 @@
 - `--num_views` [int]，默认 `1`（单/多视图；训练/测试自动兼容）
 - `--queue_warmup_steps` [int]，默认 `0`（前期仅 batch negatives）
 - `--moco_debug` `[0|1]`，默认 `0`（轻量调试）
+
+- `--contrastive_type` `[em|moco_single|moco_multi]`，默认 `em`
+  - em：使用双线性判别器的对比学习（项目原实现）
+  - moco_single：单视图 MoCo（原始图为 query，增强图为 key）
+  - moco_multi：多视图 MoCo（共享 q，每视图独立 k 与队列）
+  - 提示：当前未提供 none 选项，如需“完全关闭对比学习”，可将 `--beta`（即 `--loss_ratio2`）设为 `0`，训练仅保留监督与节点对抗分支
+
+示例：
+- 启用双视图 MoCo：
+  ```
+  python EM/main.py --contrastive_type moco_multi --num_views 2 --beta 0.5
+  ```
+- 关闭对比学习（仅监督 + 节点对抗）：
+  ```
+  python EM/main.py --contrastive_type em --beta 0
+  ```
 
 ## 9. 并行与数据加载
 - `--threads` [int]，默认 `32`  

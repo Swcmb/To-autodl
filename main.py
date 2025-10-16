@@ -22,7 +22,8 @@ from log_output_manager import (
     perform_shutdown_if_linux,
     get_logger,
     save_result_text,
-    get_run_paths
+    get_run_paths,
+    set_global_run_dir
 )
 
 # 参数改由 EM/parms_setting.py 统一解析（包含 --run_name 与 --shutdown）
@@ -81,6 +82,8 @@ def setup_parallelism(threads: int) -> None:
 # 先解析全部参数（含 run_name、shutdown）
 args = settings()
 
+
+
 # Linux 默认启用 NUMA/亲和开关（仅影响CPU亲和，不影响GPU）
 try:
     if platform.system().lower() == "linux":
@@ -116,6 +119,20 @@ redirect_print(True)
 # 创建当前运行结果目录（data_时间戳）并记录
 make_result_run_dir("data")
 logger.info("Initialized logging and result directory.")
+# 将结果保存目录切换到 EM/result 下（不影响日志输出位置）
+try:
+    from pathlib import Path
+    _paths = get_run_paths()
+    _run_id = _paths.get("run_id") or ""
+    em_result_base = Path(__file__).resolve().parent / "result"
+    name_prefix = "EM_data"
+    if args.run_name:
+        name_prefix = f"{args.run_name}_EM_data"
+    em_run_dir = em_result_base / (f"{name_prefix}_{_run_id}" if _run_id else name_prefix)
+    set_global_run_dir(em_run_dir)
+    logger.info(f"Metric outputs will be saved under: {em_run_dir}")
+except Exception as _e:
+    logger.warning(f"Failed to set EM/result run directory: {_e}")
 
 # 将后续 print 重定向到 logger.info，避免控制台重复输出
 def _print_to_logger(*args, **kwargs):
@@ -147,7 +164,7 @@ else:
     logger.info("CUDA not available, using CPU")
 np.random.seed(args.seed)  # 为NumPy设置随机种子，以确保随机数生成是可复现的
 torch.manual_seed(args.seed)  # 为PyTorch在CPU上的操作设置随机种子，保证结果一致性
-# 修复第31行的语法错误
+
 if args.cuda:  # 如果确定使用CUDA
     torch.cuda.manual_seed(args.seed)  # 也为PyTorch在GPU上的操作设置随机种子
 
@@ -200,7 +217,7 @@ for fold in range(5):
     test_loader = test_loaders[fold]
     
     # 训练和测试当前折的模型
-    fold_results = train_model(model, optimizer, data_o, data_a, train_loader, test_loader, args)
+    fold_results = train_model(model, optimizer, data_o, data_a, train_loader, test_loader, args, fold_idx=fold+1)
     all_fold_results.append(fold_results)
     
     logger.info(f"Fold {fold + 1} completed.")
@@ -239,6 +256,29 @@ if all_fold_results:
         save_result_text("\n".join(_per_fold_lines), filename=_pfname)
 else:
     logger.info("No results collected.")
+# 追加精度/召回与混淆矩阵的最终汇总保存到 EM/result/metrics，并打印
+try:
+    precisions = [result.get('precision', 0.0) for result in all_fold_results]
+    recalls = [result.get('recall', 0.0) for result in all_fold_results]
+    cm_sum = np.array([0,0,0,0], dtype=np.int64)
+    for result in all_fold_results:
+        tn, fp, fn, tp = result.get('cm', (0,0,0,0))
+        cm_sum += np.array([tn, fp, fn, tp], dtype=np.int64)
+    _paths = get_run_paths()
+    _run_id = _paths.get("run_id") or ""
+    _extra_lines = [
+        "5-Fold Extra Metrics",
+        f"Precision: {np.mean(precisions):.4f} ± {np.std(precisions):.4f}",
+        f"Recall: {np.mean(recalls):.4f} ± {np.std(recalls):.4f}",
+        f"Confusion Matrix (sum): tn={cm_sum[0]}, fp={cm_sum[1]}, fn={cm_sum[2]}, tp={cm_sum[3]}"
+    ]
+    save_result_text("\n".join(_extra_lines), filename=f"result_extra_{_run_id}.txt" if _run_id else "result_extra.txt", subdir="metrics")
+    logger.info(f"Precision: {np.mean(precisions):.4f} ± {np.std(precisions):.4f}")
+    logger.info(f"Recall: {np.mean(recalls):.4f} ± {np.std(recalls):.4f}")
+    logger.info(f"Confusion Matrix (sum): tn={cm_sum[0]}, fp={cm_sum[1]}, fn={cm_sum[2]}, tp={cm_sum[3]}")
+except Exception as _e:
+    logger.warning(f"Failed to save extra metrics: {_e}")
+
 logger.info("All folds completed!")
 # 记录运行结束并（在 Linux 且命令指定时）执行关机
 finalize_run()

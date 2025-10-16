@@ -3,8 +3,8 @@ import torch  # 导入PyTorch主库
 import torch.nn as nn  # 导入PyTorch的神经网络模块，用于构建网络层
 import torch.nn.functional as F  # 导入PyTorch的函数模块，用于激活函数、dropout等
 from torch_geometric.nn import GCNConv  # 从PyTorch Geometric库导入图卷积网络层
-from contrastive_learning import Discriminator  # 统一对比学习判别器
-from parms_setting import settings  # 从本地的parms_setting.py文件导入settings函数
+from contrastive_learning import Discriminator, MoCoV2SingleView, MoCoV2MultiView  # 统一对比学习判别器与 MoCo
+from parms_setting import settings  # 从包内导入 settings
 args = settings()  # 调用settings函数获取并存储所有超参数
 
 
@@ -64,6 +64,30 @@ class CSGLMD(nn.Module):    # 定义主模型CSGLMD
         self.sigm = nn.Sigmoid()  # 定义Sigmoid激活函数
         self.read = AvgReadout()  # 实例化平均读出层
 
+        # 根据开关初始化 MoCo 模块（EM 默认使用双线性判别器，无需额外模块）
+        ctype = getattr(args, 'contrastive_type', 'em')
+        if ctype == 'moco_single':
+            # 单视图：原始图为 query，增强图为 key
+            base_dim = hidden2
+            proj_dim = int(getattr(args, 'proj_dim', hidden2) or hidden2)
+            K = int(getattr(args, 'moco_queue', 4096))
+            m = float(getattr(args, 'moco_momentum', 0.999))
+            T = float(getattr(args, 'moco_t', 0.2))
+            warm = int(getattr(args, 'queue_warmup_steps', 0))
+            dbg = bool(getattr(args, 'moco_debug', 0))
+            self.moco_single = MoCoV2SingleView(base_dim, proj_dim, K=K, m=m, T=T, queue_warmup_steps=warm, debug=dbg)
+        elif ctype == 'moco_multi':
+            # 多视图：共享 q 投影头，每个视图独立 k 与队列
+            base_dim = hidden2
+            proj_dim = int(getattr(args, 'proj_dim', hidden2) or hidden2)
+            num_views = int(getattr(args, 'num_views', 1) or 1)
+            K = int(getattr(args, 'moco_queue', 4096))
+            m = float(getattr(args, 'moco_momentum', 0.999))
+            T = float(getattr(args, 'moco_t', 0.2))
+            warm = int(getattr(args, 'queue_warmup_steps', 0))
+            dbg = bool(getattr(args, 'moco_debug', 0))
+            self.moco_multi = MoCoV2MultiView(base_dim, proj_dim, num_views=num_views, K=K, m=m, T=T, queue_warmup_steps=warm, debug=dbg)
+
     def forward(self, data_o, data_a, idx):  # 定义模型的主前向传播逻辑
         x_o, adj = data_o.x, data_o.edge_index  # 从原始图数据中解包节点特征和邻接信息
 
@@ -103,10 +127,21 @@ class CSGLMD(nn.Module):    # 定义主模型CSGLMD
         sc_2 = sc_2.sum(1).unsqueeze(0)  # 对特征求和，得到一个分数
         logits = torch.cat((sc_1, sc_2),1)  # 拼接两个分数，用于对抗性损失
 
-        # contrastive learning  # 注释：对比学习部分
-        ret_os = self.disc(h_os, x2_o, x2_o_a)  # 计算原始图的对比损失（正样本：原始节点，负样本：损坏节点）
-        ret_os_a = self.disc(h_os_a, x2_o_a, x2_o)  # 计算损坏图的对比损失（正样本：损坏节点，负样本：原始节点）
-        
+        # contrastive learning  # 注释：对比学习部分（按开关返回 logits 与 targets，兼容 train.py 的 ce_loss）
+        ctype = getattr(args, 'contrastive_type', 'em')
+        if ctype == 'em':
+            # EM：双线性判别器输出两类 logits，targets 统一为 0（正样本为第 0 类）
+            cla_os = self.disc(h_os, x2_o, x2_o_a)  # [N,2]
+            cla_os_a = torch.zeros(cla_os.size(0), dtype=torch.long, device=cla_os.device)  # [N]
+        elif ctype == 'moco_single':
+            # 单视图 MoCo：原始图为 query，增强图为 key
+            cla_os, cla_os_a = self.moco_single(x2_o, x2_o_a)  # logits [N,1+K], targets [N]
+        else:
+            # 多视图 MoCo：若数据仅有一视图，则复用同一增强视图
+            num_views = int(getattr(args, 'num_views', 1) or 1)
+            k_embeds = [x2_o_a for _ in range(num_views)]
+            cla_list, tgt_list = self.moco_multi(x2_o, k_embeds)  # List[logits], List[targets]
+            cla_os, cla_os_a = cla_list, tgt_list
         # 根据任务类型，从批次索引idx中提取要预测的实体对的节点嵌入
         if args.task_type == 'LDA':  # 如果是lncRNA-Disease任务
             entity1 = x2_o[idx[0]]  # 获取lncRNA节点的嵌入
@@ -139,4 +174,4 @@ class CSGLMD(nn.Module):    # 定义主模型CSGLMD
         log1 = F.relu(self.decoder1(feature))  # 通过解码器的第一层并使用ReLU激活
         log = self.decoder2(log1)  # 通过解码器的第二层得到最终的预测得分
 
-        return log, ret_os, ret_os_a, x2_o, logits, log1  # 返回多个结果，用于计算不同的损失和分析
+        return log, cla_os, cla_os_a, x2_o, logits, log1  # 返回主任务输出、对比 logits/targets、节点嵌入、对抗 logits、解码器中间层

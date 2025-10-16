@@ -13,5 +13,7 @@ def Create_model(args):
             raise ValueError(f'Unknown encoder_type: {encoder_type}')
         model = EncoderClass(args)
 
-    optimizer = Adam(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    # 仅优化需要训练的参数（显式排除 requires_grad=False，例如 MoCo 动量分支/缓冲）
+    trainable_params = (p for p in model.parameters() if getattr(p, "requires_grad", True))
+    optimizer = Adam(trainable_params, lr=args.lr, weight_decay=args.weight_decay)
     return model, optimizer
