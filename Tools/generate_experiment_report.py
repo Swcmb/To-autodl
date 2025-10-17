@@ -16,6 +16,7 @@ import sys
 BASE_STR_USER = "python main.py --file dataset1/LDA.edgelist --neg_sample dataset1/non_LDA.edgelist --validation_type 5-cv1 --task_type LDA --feature_type one_hot --similarity_threshold 0.5 --embed_dim 64 --learning_rate 0.0005 --weight_decay 0.0005 --epochs 3 --alpha 0.5 --beta 0.5 --gamma 0.5"
 
 RESULT_ROOT = os.path.join("OUTPUT", "result")
+RESULT_ROOTS = [RESULT_ROOT, os.path.join("EM", "result")]
 REPORT_MD = os.path.join("EM", "test.md")
 ASSET_DIR = os.path.join(RESULT_ROOT, "_report_assets")
 FAILED_CMDS_LOG = os.path.join("OUTPUT", "log", "failed_commands.txt")
@@ -185,22 +186,30 @@ def parse_summary_file(fp: str) -> Dict[str, Any]:
         head = parts[0]
         if "-" in head:
             enc, fus = head.split("-", 1)
-            data.setdefault("encoder_type", enc)
-            data.setdefault("fusion_type", fus)
+            if not normalize_text(data.get("encoder_type")):
+                data["encoder_type"] = enc
+            if not normalize_text(data.get("fusion_type")):
+                data["fusion_type"] = fus
         else:
-            data.setdefault("encoder_type", head)
+            if not normalize_text(data.get("encoder_type")):
+                data["encoder_type"] = head
 
         for p in parts[1:]:
             if p.startswith("ft-"):
-                data.setdefault("feature_type", p[3:])
+                if not normalize_text(data.get("feature_type")):
+                    data["feature_type"] = p[3:]
             elif p.startswith("aug-"):
-                data.setdefault("augment", p[4:])
+                if not normalize_text(data.get("augment")):
+                    data["augment"] = p[4:]
             elif p.startswith("am-"):
-                data.setdefault("augment_mode", p[3:])
+                if not normalize_text(data.get("augment_mode")):
+                    data["augment_mode"] = p[3:]
             elif p.startswith("qw-"):
-                data.setdefault("queue_warmup_steps", p[3:])
+                if not normalize_text(data.get("queue_warmup_steps")):
+                    data["queue_warmup_steps"] = p[3:]
             elif p.startswith("moco-"):
-                data.setdefault("moco", p[5:])
+                if not normalize_text(data.get("moco")):
+                    data["moco"] = p[5:]
 
     # 目录名提示 moco
     dir_low = data["_dir"].lower()
@@ -219,15 +228,17 @@ def parse_summary_file(fp: str) -> Dict[str, Any]:
 
 def collect_all_summaries() -> List[Dict[str, Any]]:
     rows: List[Dict[str, Any]] = []
-    if not os.path.isdir(RESULT_ROOT):
-        return rows
-    for sub in sorted(os.listdir(RESULT_ROOT)):
-        subdir = os.path.join(RESULT_ROOT, sub)
-        if not os.path.isdir(subdir):
+    roots = RESULT_ROOTS if 'RESULT_ROOTS' in globals() else [RESULT_ROOT]
+    for root in roots:
+        if not os.path.isdir(root):
             continue
-        for fname in os.listdir(subdir):
-            if fname.startswith("result_summary_") and fname.endswith(".txt"):
-                rows.append(parse_summary_file(os.path.join(subdir, fname)))
+        for sub in sorted(os.listdir(root)):
+            subdir = os.path.join(root, sub)
+            if not os.path.isdir(subdir):
+                continue
+            for fname in os.listdir(subdir):
+                if fname.startswith("result_summary_") and fname.endswith(".txt"):
+                    rows.append(parse_summary_file(os.path.join(subdir, fname)))
     return rows
 
 # ========== 组合与命令构建 ==========
