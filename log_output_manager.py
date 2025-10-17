@@ -9,6 +9,7 @@ from typing import Optional, Union, Iterable
 
 # 全局状态
 _LOGGER: Optional[logging.Logger] = None
+_ONCE_KEYS: set[str] = set()
 _RUN_ID: Optional[str] = None
 _RUN_NAME: Optional[str] = None
 _BASE_DIR = Path(__file__).resolve().parent.parent  # 项目根 d:/Paper-code
@@ -90,6 +91,19 @@ def init_logging(run_name: Optional[str] = None,
     _LOGGER = logger
     return logger
 
+
+def log_once(key: str, message: str, logger_name: Optional[str] = None, level: str = "info") -> bool:
+    """
+    仅记录一次的日志。相同 key 在整个运行期只输出一次。
+    返回是否完成输出（True 表示本次是首次输出）。
+    """
+    if key in _ONCE_KEYS:
+        return False
+    _ONCE_KEYS.add(key)
+    logger = get_logger(logger_name) if logger_name else get_logger()
+    lvl = getattr(logging, level.upper(), logging.INFO)
+    logger.log(lvl, message)
+    return True
 
 def get_logger(name: Optional[str] = None) -> logging.Logger:
     """
@@ -271,3 +285,78 @@ def perform_shutdown_if_linux(shutdown: bool) -> bool:
         logger.warning("Shutdown NOT executed. Set environment ENABLE_SHUTDOWN=1 to allow.")
         logger.warning("Manual command: sudo shutdown -h now")
         return False
+
+# ========== 数据保存工具（集中于此）==========
+import json
+from datetime import datetime
+
+def save_dataset(array, out_path: str, fmt: str = "npy") -> str:
+    """
+    保存构建的总数据或某折数据。
+    - array: 待保存的 numpy.ndarray 或兼容数组
+    - out_path: 相对或绝对路径；相对路径以 EM 目录为基准
+    - fmt: 'npy' 或 'txt'（空格分隔）
+    返回最终写入的绝对路径字符串。
+    """
+    # 延迟导入，避免在无 numpy 的环境下提前失败
+    import numpy as _np
+    logger = get_logger("save.dataset")
+
+    # 将相对路径解析为相对于 EM 目录（本文件所在目录）的绝对路径
+    em_dir = Path(__file__).resolve().parent
+    out_full = Path(out_path)
+    if not out_full.is_absolute():
+        out_full = em_dir / out_full
+
+    # 确保父目录存在
+    out_full.parent.mkdir(parents=True, exist_ok=True)
+
+    # 执行保存
+    if fmt == "npy":
+        _np.save(str(out_full), array)
+    elif fmt == "txt":
+        _np.savetxt(str(out_full), array, fmt="%d")
+    else:
+        raise ValueError("不支持的保存格式，仅支持 'npy' 或 'txt'")
+
+    logger.info(f"Saved dataset to {out_full}")
+    return str(out_full)
+
+def save_cv_datasets(args, total_data, train_data_folds, test_data_folds, base_dir: str) -> None:
+    """
+    保存交叉验证数据集切分：
+    - 输出目录：{base_dir}/{args.save_dir_prefix}_YYYYmmdd_HHMMSS
+    - 文件：total_data.{fmt}、train_fold_i.{fmt}、test_fold_i.{fmt}
+    依赖：label_annotation.save_dataset（延迟导入以避免循环）
+    """
+    lg = get_logger("save_dataset")
+    try:
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        prefix_dir = os.path.join(base_dir, args.save_dir_prefix)
+        out_dir = f"{prefix_dir}_{timestamp}"
+        os.makedirs(out_dir, exist_ok=True)
+        fmt = getattr(args, "save_format", "txt")
+
+        save_dataset(total_data, os.path.join(out_dir, f"total_data.{fmt}"), fmt=fmt)
+        for idx, (train_data, test_data) in enumerate(zip(train_data_folds, test_data_folds), start=1):
+            save_dataset(train_data, os.path.join(out_dir, f"train_fold_{idx}.{fmt}"), fmt=fmt)
+            save_dataset(test_data, os.path.join(out_dir, f"test_fold_{idx}.{fmt}"), fmt=fmt)
+        lg.info(f"Saved datasets to: {out_dir}")
+    except Exception as e:
+        lg.warning(f"Failed to save cv datasets: {e}")
+
+def save_fold_stats_json(fold_stats: list, base_dir: str, filename: str = "fold_stats.json") -> None:
+    """
+    将折级统计写入 OUTPUT/result/metrics/{filename}
+    base_dir: 一般为 EM 目录（__file__ 所在目录）
+    """
+    lg = get_logger("fold_stats")
+    try:
+        root_dir = os.path.abspath(os.path.join(base_dir, os.pardir, "OUTPUT", "result", "metrics"))
+        os.makedirs(root_dir, exist_ok=True)
+        out_path = os.path.join(root_dir, filename)
+        with open(out_path, "w", encoding="utf-8") as f:
+            json.dump(fold_stats, f, ensure_ascii=False, indent=2)
+        lg.info(f"Saved fold stats to {out_path}")
+    except Exception as e:
+        lg.warning(f"Failed to save fold stats: {e}")

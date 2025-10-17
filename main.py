@@ -1,82 +1,25 @@
-import torch  # 导入PyTorch深度学习框架
-import numpy as np  # 导入NumPy库，用于进行科学计算，特别是数组操作
-from parms_setting import settings  # 从本地的parms_setting.py文件导入settings函数，用于获取所有超参数
-from data_preprocess import load_data  # 从本地的data_preprocess.py文件导入load_data函数，用于加载和预处理数据
-from instantiation import Create_model  # 从本地的instantiation.py文件导入Create_model函数，用于创建模型和优化器
-from train import train_model  # 从本地的train.py文件导入train_model函数，用于执行模型的训练和评估流程
-from data_preprocess import get_fold_data  # 导入get_fold_data函数，用于获取指定折的数据
-import os  # 导入os模块，用于与操作系统交互，如此处设置环境变量
-import numpy as np
-# 集中日志与结果管理
-import argparse
-import platform  # 检测操作系统平台
+import os, sys  # 系统交互（环境变量、路径等）
+# 让以 'python model/main.py' 运行时也能按包导入
 try:
-    import psutil  # CPU亲和设置（可选）
+    ROOT = os.path.dirname(os.path.dirname(__file__))
+    if ROOT and ROOT not in sys.path:
+        sys.path.insert(0, ROOT)
 except Exception:
-    psutil = None
-from log_output_manager import (
-    init_logging,
-    redirect_print,
-    make_result_run_dir,
-    finalize_run,
-    perform_shutdown_if_linux,
-    get_logger,
-    save_result_text,
-    get_run_paths,
-    set_global_run_dir
-)
+    pass
+import torch  # PyTorch 深度学习框架
+import numpy as np  # 科学计算与数组操作
+from parms_setting import settings  # 参数与超参数设置
+from utils import set_global_seed  # 随机性统一设置
+from data_preprocess import load_data, get_fold_data  # 数据加载与折叠划分
+from instantiation import Create_model  # 模型实例化
+from train import train_model  # 训练流程
+from autodl import init_autodl_env  # 自动并行与环境初始化
+from log_output_manager import *
+
 
 # 参数改由 EM/parms_setting.py 统一解析（包含 --run_name 与 --shutdown）
 
-def _detect_linux_numa_node0_cpus():
-    try:
-        nodes_path = "/sys/devices/system/node"
-        if not os.path.isdir(nodes_path):
-            return None
-        node0 = os.path.join(nodes_path, "node0")
-        if not os.path.isdir(node0):
-            return None
-        cpu_list = []
-        for name in os.listdir(node0):
-            if name.startswith("cpu") and name[3:].isdigit():
-                cpu_list.append(int(name[3:]))
-        return sorted(cpu_list) if cpu_list else None
-    except Exception:
-        return None
-
-def _set_cpu_affinity_linux(cpus):
-    try:
-        if psutil is not None:
-            p = psutil.Process(os.getpid())
-            p.cpu_affinity(cpus)
-            return True
-    except Exception:
-        pass
-    try:
-        if hasattr(os, "sched_setaffinity"):
-            os.sched_setaffinity(0, set(cpus))
-            return True
-    except Exception:
-        pass
-    return False
-
-def setup_parallelism(threads: int) -> None:
-    # 统一设置数值后端线程数（不调节 torch.set_num_threads 以免影响 GPU）
-    t = int(max(1, min(32, threads)))
-    for k in ["OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS", "NUMEXPR_NUM_THREADS", "VECLIB_MAXIMUM_THREADS", "BLIS_NUM_THREADS"]:
-        os.environ[k] = str(t)
-    # 可选：CPU亲和/NUMA绑定（仅Linux，受环境变量 EM_USE_NUMA 或 EM_CPU_AFFINITY 控制）
-    try:
-        if platform.system().lower() == "linux":
-            use_aff = os.environ.get("EM_USE_NUMA") == "1" or os.environ.get("EM_CPU_AFFINITY") == "1"
-            if use_aff:
-                cpus = _detect_linux_numa_node0_cpus()
-                if not cpus:
-                    total = os.cpu_count() or 32
-                    cpus = list(range(min(t, total)))
-                _ = _set_cpu_affinity_linux(cpus)
-    except Exception:
-        pass
+# 性能优化相关函数已迁移至 autodl.py
 
 # 初始化集中日志（文件+控制台），日志开头记录完整命令
 # 先解析全部参数（含 run_name、shutdown）
@@ -84,33 +27,8 @@ args = settings()
 
 
 
-# Linux 默认启用 NUMA/亲和开关（仅影响CPU亲和，不影响GPU）
-try:
-    if platform.system().lower() == "linux":
-        if os.environ.get("EM_USE_NUMA") is None and os.environ.get("EM_CPU_AFFINITY") is None:
-            os.environ["EM_USE_NUMA"] = "1"
-except Exception:
-    pass
-
-# 统一并行线程设置（自动探测并裁剪至32）
-setup_parallelism(getattr(args, "threads", 32))
-
-# 将关键并行参数同步到环境变量，供下游CPU并行计算读取（固化默认：workers=8, chunk=20000）
-try:
-    _threads = int(getattr(args, "threads", 32))
-    _workers = int(getattr(args, "num_workers", -1))
-    if _workers == -1:
-        _workers = min(8, max(1, _threads))
-    _chunk = int(getattr(args, "chunk_size", 0))
-    if _chunk in (0, None):
-        _chunk = 20000
-    os.environ["EM_THREADS"] = str(min(32, max(1, _threads)))
-    os.environ["EM_WORKERS"] = str(min(32, max(0, _workers)))
-    os.environ["EM_CHUNK_SIZE"] = str(max(1, _chunk))
-except Exception:
-    os.environ.setdefault("EM_THREADS", "32")
-    os.environ.setdefault("EM_WORKERS", "8")
-    os.environ.setdefault("EM_CHUNK_SIZE", "20000")
+# 统一性能优化初始化（NUMA/亲和、并行线程、环境变量注入）
+init_autodl_env(args)
 
 # 初始化集中日志（文件+控制台），带 run_name
 logger = init_logging(run_name=args.run_name)
@@ -119,20 +37,7 @@ redirect_print(True)
 # 创建当前运行结果目录（data_时间戳）并记录
 make_result_run_dir("data")
 logger.info("Initialized logging and result directory.")
-# 将结果保存目录切换到 EM/result 下（不影响日志输出位置）
-try:
-    from pathlib import Path
-    _paths = get_run_paths()
-    _run_id = _paths.get("run_id") or ""
-    em_result_base = Path(__file__).resolve().parent / "result"
-    name_prefix = "EM_data"
-    if args.run_name:
-        name_prefix = f"{args.run_name}_EM_data"
-    em_run_dir = em_result_base / (f"{name_prefix}_{_run_id}" if _run_id else name_prefix)
-    set_global_run_dir(em_run_dir)
-    logger.info(f"Metric outputs will be saved under: {em_run_dir}")
-except Exception as _e:
-    logger.warning(f"Failed to set EM/result run directory: {_e}")
+
 
 # 将后续 print 重定向到 logger.info，避免控制台重复输出
 def _print_to_logger(*args, **kwargs):
@@ -152,21 +57,14 @@ os.environ["CUDA_VISIBLE_DEVICES"] = "0"
 # parameters setting  # 注释：参数设置（已提前解析，此处无需重复）
 # args 已在日志初始化前由 settings() 获取
 
-# 检查CUDA（GPU计算）是否可用，并根据args.no_cuda标志来决定是否使用GPU
-args.cuda = not args.no_cuda and torch.cuda.is_available()
-logger.info(f"CUDA available: {torch.cuda.is_available()}")
-logger.info(f"Using CUDA: {args.cuda}")
-if torch.cuda.is_available():
-    logger.info(f"CUDA device count: {torch.cuda.device_count()}")
-    logger.info(f"Current CUDA device: {torch.cuda.current_device()}")
-    logger.info(f"CUDA device name: {torch.cuda.get_device_name()}")
-else:
-    logger.info("CUDA not available, using CPU")
-np.random.seed(args.seed)  # 为NumPy设置随机种子，以确保随机数生成是可复现的
-torch.manual_seed(args.seed)  # 为PyTorch在CPU上的操作设置随机种子，保证结果一致性
-
-if args.cuda:  # 如果确定使用CUDA
-    torch.cuda.manual_seed(args.seed)  # 也为PyTorch在GPU上的操作设置随机种子
+# 固定使用 CUDA，不再进行可用性检查
+args.cuda = True
+logger.info("Using CUDA: True")
+logger.info(f"CUDA device count: {torch.cuda.device_count()}")
+logger.info(f"Current CUDA device: {torch.cuda.current_device()}")
+logger.info(f"CUDA device name: {torch.cuda.get_device_name()}")
+# 统一随机性：一次性在入口设置（含 Python/NumPy/PyTorch/CUDA/cuDNN）
+set_global_seed(int(getattr(args, "seed", 0)))
 
 # 打印增强配置汇总
 try:

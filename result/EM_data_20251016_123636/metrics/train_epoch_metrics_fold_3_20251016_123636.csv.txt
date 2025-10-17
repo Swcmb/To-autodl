@@ -1,2 +1,0 @@
-epoch,loss_train,task_loss,cont_loss,adv_loss,auroc,auprc,precision,recall,f1,tn,fp,fn,tp
-1,0.914547,0.385208,0.496906,0.561772,0.847495,0.819044,0.716988,0.881395,0.790736,1402,748,255,1895

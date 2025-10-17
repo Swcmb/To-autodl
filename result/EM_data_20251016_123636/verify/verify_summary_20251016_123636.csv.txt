@@ -1,7 +1,0 @@
-metric,mean,std
-auroc_mean,0.909621,0.004623
-auprc_mean,0.909873,0.007376
-precision_mean,0.807934,0.047721
-recall_mean,0.841654,0.047045
-f1_mean,0.819516,0.002742
-loss_mean,0.640861,0.183694

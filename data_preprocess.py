@@ -1,51 +1,58 @@
-from torch_geometric.data import Data  # 从PyTorch Geometric库中导入Data类，用于封装图数据
-from torch.utils.data import Dataset, DataLoader  # 从PyTorch中导入Dataset和DataLoader，用于创建和加载数据集
-from utils import *  # 从本地的utils.py文件中导入所有函数
-import numpy as np  # 导入numpy库，用于高效的数值计算
-import torch  # 导入PyTorch库，用于深度学习
-import scipy.sparse as sp  # 导入scipy的稀疏矩阵模块，用于处理稀疏数据
-import os  # 基于文件目录解析数据路径
-import platform  # 按操作系统控制CPU并行策略（Linux开，Windows关）
-from datetime import datetime
-from layer import load_positive, load_negative_all, sample_negative, attach_labels
-from log_output_manager import save_dataset
-from calculating_similarity import calculate_GaussianKernel_sim, getRNA_functional_sim, RNA_fusion_sim, dis_fusion_sim
-from log_output_manager import get_logger
-from enhance import apply_augmentation
-
-# 统一路径解析：若为相对路径，则相对 EM 目录解析
-BASE_DIR = os.path.dirname(__file__)
-def _p(path: str) -> str:
-    return path if os.path.isabs(path) else os.path.join(BASE_DIR, path)
-
-"This code uses five-fold cross-validation"  # 字符串注释：此代码使用五折交叉验证
-
-class Data_class(Dataset):  # 定义一个自定义的数据集类，继承自PyTorch的Dataset类
-
-    def __init__(self, triple):  # 类的初始化方法，接收一个三元组数组（实体1, 实体2, 标签）
-        self.entity1 = triple[:, 0]  # 提取所有样本的第一个实体
-        self.entity2 = triple[:, 1]  # 提取所有样本的第二个实体
-        self.label = triple[:, 2]  # 提取所有样本的标签（0或1）
-
-    def __len__(self):  # 定义获取数据集大小的方法
-        return len(self.label)  # 数据集的大小即为标签的数量
-
-    def __getitem__(self, index):  # 定义通过索引获取单个样本的方法
-
-        return self.label[index], (self.entity1[index], self.entity2[index])  # 返回指定索引的标签和实体对
+import platform               # OS 判定（用于控制并行策略）
+import hashlib                # 轻量哈希（折级统计用）
+from datetime import datetime # 时间戳与日志记录
+import numpy as np            # 数值计算
+import torch                  # 深度学习张量与设备管理
+import scipy.sparse as sp     # 稀疏矩阵运算
+from torch.utils.data import Dataset, DataLoader  # 数据集与加载器
+from torch_geometric.data import Data             # 图数据封装（PyTorch Geometric）
+from autodl import decide_dataloader_workers      # 统一 DataLoader 并行策略
+from utils import *                         # 通用工具（含 BASE_DIR、图构建、归一化等）
+from utils import em_path as _p             # 统一路径解析（简写）
+from layer import load_positive, load_negative_all, sample_negative, attach_labels, apply_augmentation# 样本构建与特征增强
+from calculating_similarity import calculate_GaussianKernel_sim, getRNA_functional_sim, RNA_fusion_sim, dis_fusion_sim# 相似度计算
+from log_output_manager import get_logger, save_cv_datasets, save_fold_stats_json# 日志与数据保存
 
 
+# ===== 说明：本模块默认使用五折交叉验证 =====
+
+
+# =================================================
+# 数据集定义
+# =================================================
+class Data_class(Dataset):
+    """三元组数据集：返回 (label, (entity1, entity2))"""
+    def __init__(self, triple):
+        # triple 期望形状为 [N, 3]，列分别为 entity1, entity2, label
+        self.entity1 = triple[:, 0]
+        self.entity2 = triple[:, 1]
+        self.label = triple[:, 2]
+
+    def __len__(self):
+        # 数据集大小
+        return len(self.label)
+
+    def __getitem__(self, index):
+        # 单样本：返回 (label, (entity1, entity2))
+        return self.label[index], (self.entity1[index], self.entity2[index])
+
+
+# =================================================
+# 折数据访问辅助
+# =================================================
 def get_fold_data(data_o, data_a, train_loaders, test_loaders, fold_index):
-    """获取指定折的数据加载器"""
+    """获取指定折的数据加载器与特征视图"""
     if fold_index >= len(train_loaders) or fold_index < 0:
         raise ValueError(f"Fold index {fold_index} is out of range. Available folds: 0-{len(train_loaders)-1}")
-    
     return data_o, data_a, train_loaders[fold_index], test_loaders[fold_index]
 
 
-def load_data(args, k_fold=5):  # 定义加载数据的主函数，接收命令行参数和折数
-    """Read data from path, convert data into k-fold cross validation loaders, return features and adjacency"""  # 函数文档字符串：从路径读取数据，转换为k折交叉验证加载器，返回特征和邻接矩阵
-    # read data  # 注释：读取数据
+# =================================================
+# 主流程：读取数据并构建五折交叉验证
+# =================================================
+def load_data(args, k_fold=5):
+    """从路径读取数据，转换为 k 折交叉验证加载器，返回特征与邻接"""
+    # 日志：运行配置
     _logger = get_logger()
     _logger.info('Loading {0} seed{1} dataset...'.format(args.in_file, args.seed))
     _logger.info(f"Selected cross_validation type: {args.validation_type}")
@@ -55,26 +62,27 @@ def load_data(args, k_fold=5):  # 定义加载数据的主函数，接收命令�
     _logger.info(f"Selected learning_rate: {getattr(args, 'learning_rate', 'N/A')}")
     _logger.info(f"Selected epochs: {getattr(args, 'epochs', 'N/A')}")
 
-    # 根据 validation_type 实现两种折分割策略
-    # 加载正样本与负样本全集，并附加标签
+    # 读取正样本与负样本全集
     positive = load_positive(args.in_file, args.seed)  # shape=(P,2)
     negative_all = load_negative_all(args.neg_sample, args.seed)  # shape=(N,2)
 
-    # 统一正样本添加标签
+    # 为正样本附加标签（1）
     pos_lbl = np.ones(positive.shape[0], dtype=np.int64).reshape(positive.shape[0], 1)
     positive_labeled = np.concatenate([positive, pos_lbl], axis=1)
 
+    # 容器
     train_data_folds = []
     test_data_folds = []
     train_loaders = []
     test_loaders = []
 
+    # 两种折分方案：5_cv2 与 默认 5_cv1
     if args.validation_type == '5_cv2':
-        # 5-cv2:
-        # - 正样本分5折；训练用4折正样本 + 等量随机负样本；测试用1折正样本 + 全部负样本
+        # 5-cv2：
+        # - 正样本分 5 折；训练用 4 折正样本 + 等量随机负样本；测试用 1 折正样本 + 全部负样本
         fold_size = positive.shape[0] // 5
 
-        # 全负样本添加标签（测试集使用全部负样本）
+        # 全负样本附加标签（测试集使用全部负样本）
         neg_all_lbl = np.zeros(negative_all.shape[0], dtype=np.int64).reshape(negative_all.shape[0], 1)
         negative_all_labeled = np.concatenate([negative_all, neg_all_lbl], axis=1)
 
@@ -85,11 +93,11 @@ def load_data(args, k_fold=5):  # 定义加载数据的主函数，接收命令�
             test_positive = positive_labeled[start_idx:end_idx]
             train_positive = np.vstack((positive_labeled[:start_idx], positive_labeled[end_idx:]))
 
-            # 训练负样本：等量随机选取
-            # 为保证不同折的随机性，这里使用每折不同的种子派生
-            np.random.seed(args.seed + fold)
+            # 训练负样本：等量随机采样（局部生成器，避免污染全局）
+            rng = np.random.default_rng(int(args.seed) + fold)
             neg_shuffled = negative_all.copy()
-            np.random.shuffle(neg_shuffled)
+            idx = rng.permutation(neg_shuffled.shape[0])
+            neg_shuffled = neg_shuffled[idx]
             train_neg_sampled = np.asarray(neg_shuffled[:train_positive.shape[0]])
             train_neg_lbl = np.zeros(train_neg_sampled.shape[0], dtype=np.int64).reshape(train_neg_sampled.shape[0], 1)
             train_negative = np.concatenate([train_neg_sampled, train_neg_lbl], axis=1)
@@ -97,7 +105,7 @@ def load_data(args, k_fold=5):  # 定义加载数据的主函数，接收命令�
             # 测试负样本：全部负样本
             test_negative = negative_all_labeled
 
-            # 构建训练集与测试集
+            # 拼接训练集/测试集
             train_data = np.vstack((train_positive, train_negative))
             test_data = np.vstack((test_positive, test_negative))
 
@@ -105,13 +113,11 @@ def load_data(args, k_fold=5):  # 定义加载数据的主函数，接收命令�
             test_data_folds.append(test_data)
 
         total_data = np.vstack((positive_labeled, negative_all_labeled))
-        # 选取第一折数据用于图构建
-        train_data = train_data_folds[0]
-        test_data = test_data_folds[0]
 
     else:
         # 默认 5_cv1：
-        # - 采样与正样本等量的负样本；正负样本按相同索引区间切分；每折内拼接为 train/test
+        # - 负样本采样为与正样本等量
+        # - 正负样本按同一索引区间切分为 5 折
         neg_sampled = sample_negative(negative_all, positive.shape[0])
         neg_lbl = np.zeros(neg_sampled.shape[0], dtype=np.int64).reshape(neg_sampled.shape[0], 1)
         negative_labeled = np.concatenate([neg_sampled, neg_lbl], axis=1)
@@ -122,15 +128,15 @@ def load_data(args, k_fold=5):  # 定义加载数据的主函数，接收命令�
             start_idx = fold * fold_size
             end_idx = (fold + 1) * fold_size if fold < 4 else positive.shape[0]
 
-            # 划分阳性
+            # 阳性划分
             test_positive = positive_labeled[start_idx:end_idx]
             train_positive = np.vstack((positive_labeled[:start_idx], positive_labeled[end_idx:]))
 
-            # 划分阴性（与正样本使用相同索引区间）
+            # 阴性划分（同样索引区间）
             test_negative = negative_labeled[start_idx:end_idx]
             train_negative = np.vstack((negative_labeled[:start_idx], negative_labeled[end_idx:]))
 
-            # 构建训练集与测试集
+            # 拼接训练集/测试集
             train_data = np.vstack((train_positive, train_negative))
             test_data = np.vstack((test_positive, test_negative))
 
@@ -138,40 +144,31 @@ def load_data(args, k_fold=5):  # 定义加载数据的主函数，接收命令�
             test_data_folds.append(test_data)
 
         total_data = np.vstack((positive_labeled, negative_labeled))
-        # 选取第一折数据用于图构建
-        train_data = train_data_folds[0]
-        test_data = test_data_folds[0]
 
-    # 保存（可选）
+    # （可选）保存折数据，由 log_output_manager 统一实现
     if getattr(args, 'save_datasets', True):
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        prefix_dir = os.path.join(BASE_DIR, args.save_dir_prefix)
-        out_dir = f"{prefix_dir}_{timestamp}"
-        os.makedirs(out_dir, exist_ok=True)
-        save_dataset(total_data, os.path.join(out_dir, f"total_data.{args.save_format}"), fmt=args.save_format)
-        for idx, (train_data, test_data) in enumerate(zip(train_data_folds, test_data_folds), start=1):
-            save_dataset(train_data, os.path.join(out_dir, f"train_fold_{idx}.{args.save_format}"), fmt=args.save_format)
-            save_dataset(test_data, os.path.join(out_dir, f"test_fold_{idx}.{args.save_format}"), fmt=args.save_format)
-        _logger.info(f"Saved datasets to: {out_dir}")
-
+        save_cv_datasets(args, total_data, train_data_folds, test_data_folds, BASE_DIR)
 
     _logger.info('Selected task type...')
+
     # 每折输出容器
     data_o_folds = []
     data_a_folds = []
+    fold_stats = []  # 收集每折统计与哈希
 
     # 疾病语义相似度（固定来源文件）
     dis_sem_sim = np.loadtxt(_p("dataset1/dis_sem_sim.txt"))
 
+    # ✅ 修复1：移除硬编码第0折选择，改为每折独立构建图
+
     def mask_pairs(mat, pairs):
-        # 将测试集关联位置置 0（临时掩码）——向量化以避免 Python 循环
+        """将测试集关联位置置 0（临时掩码，向量化实现）"""
         if pairs is None:
             return
         try:
             if len(pairs) == 0:
                 return
         except TypeError:
-            # 非可迭代或非预期类型，直接返回
             return
         p = np.asarray(pairs, dtype=int)
         if p.ndim != 2 or p.shape[1] != 2:
@@ -274,15 +271,15 @@ def load_data(args, k_fold=5):  # 定义加载数据的主函数，接收命令�
         edges_o = adj.nonzero()
         edge_index_o = torch.tensor(np.vstack((edges_o[0], edges_o[1])), dtype=torch.long)
 
-        # 特征
+        # 特征构建
         if args.feature_type == 'one_hot':
             features = np.eye(adj.shape[0])
         elif args.feature_type == 'uniform':
-            np.random.seed(args.seed)
-            features = np.random.uniform(low=0, high=1, size=(adj.shape[0], args.dimensions))
+            rng = np.random.default_rng(int(args.seed))
+            features = rng.uniform(low=0, high=1, size=(adj.shape[0], args.dimensions))
         elif args.feature_type == 'normal':
-            np.random.seed(args.seed)
-            features = np.random.normal(loc=0, scale=1, size=(adj.shape[0], args.dimensions))
+            rng = np.random.default_rng(int(args.seed))
+            features = rng.normal(loc=0, scale=1, size=(adj.shape[0], args.dimensions))
         elif args.feature_type == 'position':
             features = sp.coo_matrix(adj).todense()
         else:
@@ -304,51 +301,77 @@ def load_data(args, k_fold=5):  # 定义加载数据的主函数，接收命令�
             base_seed = int(getattr(args, "seed", 0)) + fold
 
         _aug_key = (aug_name or "").strip().lower()
+        # 将特征放到 GPU/CPU（按 args.cuda）上，增强直接在 Tensor 上进行
+        _device = torch.device("cuda") if getattr(args, "cuda", False) and torch.cuda.is_available() else torch.device("cpu")
+        x_o = torch.tensor(features_o, dtype=torch.float, device=_device)
         if _aug_key in {"", "none", "null"}:
-            # 无增强：直接引用原特征，避免不必要拷贝/转换
-            features_a = features_o
+            # 无增强：直接引用原特征张量
+            features_a = x_o
         else:
             features_a = apply_augmentation(
                 aug_name,
-                features_o,
+                x_o,
                 noise_std=noise_std,
                 mask_rate=mask_rate,
                 seed=base_seed
             )
 
-        # 日志记录增强统计
+        # 记录增强统计（全 Torch 计算，避免 numpy 回落）与折级统计
         try:
             _alog = get_logger("augment")
-            masked_cols = int(np.sum(np.all(features_a == 0, axis=0))) if isinstance(features_a, np.ndarray) else 0
-            _alog.info(f"[AUGMENT][fold={fold+1}] name={aug_name} noise_std={noise_std} mask_rate={mask_rate} seed={base_seed} masked_cols={masked_cols} shape={features_a.shape} mean={np.mean(features_a):.4f} std={np.std(features_a):.4f}")
+            masked_cols = int((features_a == 0).all(dim=0).sum().item())
+            mean_o = float(x_o.mean().item())
+            std_o = float(x_o.float().std(unbiased=False).item()) if x_o.numel() > 1 else 0.0
+            mean_a = float(features_a.mean().item())
+            std_a = float(features_a.float().std(unbiased=False).item()) if features_a.numel() > 1 else 0.0
+            _shape = tuple(features_a.shape)
+            _alog.info(f"[AUGMENT][fold={fold+1}] name={aug_name} noise_std={noise_std} mask_rate={mask_rate} seed={base_seed} masked_cols={masked_cols} shape={_shape} mean={mean_a:.4f} std={std_a:.4f}")
+        except Exception:
+            masked_cols = 0
+            mean_o = std_o = mean_a = std_a = 0.0
+
+        # 相似度与图的轻量哈希（跨折可比，不写出大矩阵）
+        try:
+            def _sha1_arr(arr: np.ndarray) -> str:
+                h = hashlib.sha1()
+                h.update(arr.tobytes())
+                return h.hexdigest()[:16]
+            hash_l = _sha1_arr(l_sim.astype(np.uint8)) if 'l_sim' in locals() else "-"
+            hash_m = _sha1_arr(m_sim.astype(np.uint8)) if 'm_sim' in locals() else "-"
+            hash_d = _sha1_arr(d_sim.astype(np.uint8)) if 'd_sim' in locals() else "-"
+        except Exception:
+            hash_l = hash_m = hash_d = "-"
+
+        # 记录每折统计（训练/测试规模、mask 数、特征统计、增强配置、相似度哈希）
+        try:
+            fold_stats.append({
+                "fold": fold + 1,
+                "train_size": int(train_data.shape[0]),
+                "test_size": int(test_data.shape[0]),
+                "pos_train": int((train_data[:,2] == 1).sum()),
+                "pos_test": int((test_data[:,2] == 1).sum()),
+                "masked_cols_in_aug": int(masked_cols),
+                "features_o": {"mean": mean_o, "std": std_o, "shape": list(features_o.shape)},
+                "features_a": {"mean": mean_a, "std": std_a, "shape": list(features_a.shape)},
+                "augment": {"name": str(aug_name), "noise_std": float(noise_std), "mask_rate": float(mask_rate), "seed": int(base_seed)},
+                "similarity_hash": {"lnc": hash_l, "mi": hash_m, "dis": hash_d}
+            })
         except Exception:
             pass
 
-        y_a = torch.cat((torch.ones(adj.shape[0], 1), torch.zeros(adj.shape[0], 1)), dim=1)
+        # y_a：对抗视图的二分类标签（未使用占位，保持与下游兼容）
+        y_a = torch.cat((torch.ones(adj.shape[0], 1), torch.zeros(adj.shape[0], 1)), dim=1).to(x_o.device)
 
-        x_o = torch.tensor(features_o, dtype=torch.float)
-        data_o = Data(x=x_o, edge_index=edge_index_o)
-
-        x_a = torch.tensor(features_a, dtype=torch.float)
-        data_a = Data(x=x_a, y=y_a)
+        # 构造图数据对象（边索引放同设备，减少搬运）
+        data_o = Data(x=x_o, edge_index=edge_index_o.to(x_o.device))
+        data_a = Data(x=features_a, y=y_a)
 
         data_o_folds.append(data_o)
         data_a_folds.append(data_a)
 
-    # 为所有折构建 DataLoader（Linux 自动开启CPU优化，Windows 自动关闭）
+    # 为所有折构建 DataLoader（并行策略由 autodl 决策）
     os_name = platform.system().lower()
-    threads = int(getattr(args, "threads", 32) or 32)
-    req_workers = getattr(args, "num_workers", -1)
-    num_workers = int(req_workers if req_workers is not None else -1)
-
-    if os_name.startswith("win"):
-        # Windows：写死关闭CPU并行数据加载
-        num_workers = 0
-    else:
-        # Linux/mac 等：启用自动并行（与 To-autodl 对齐；NUMA/亲和在 main.py 控制）
-        if num_workers == -1:
-            num_workers = min(8, max(1, threads))
-
+    num_workers = decide_dataloader_workers(args)
     prefetch_factor = int(getattr(args, "prefetch_factor", 4) or 4)
 
     base_params = {'batch_size': args.batch, 'shuffle': True, 'drop_last': True}
@@ -372,6 +395,9 @@ def load_data(args, k_fold=5):  # 定义加载数据的主函数，接收命令�
         train_loaders.append(DataLoader(training_set, **base_params))
         test_set = Data_class(test_data_folds[fold])
         test_loaders.append(DataLoader(test_set, **base_params))
+
+    # 写出折级统计（OUTPUT/result/metrics）
+    save_fold_stats_json(fold_stats, BASE_DIR)
 
     _logger.info('Loading finished!')
     return data_o_folds, data_a_folds, train_loaders, test_loaders

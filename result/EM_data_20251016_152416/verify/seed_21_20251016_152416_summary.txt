@@ -1,8 +1,0 @@
-seed=21
-auroc_mean=0.904567, auroc_std=0.017558
-auprc_mean=0.901114, auprc_std=0.021579
-precision_mean=0.759840, precision_std=0.038437
-recall_mean=0.888315, recall_std=0.059626
-f1_mean=0.816406, f1_std=0.016015
-loss_mean=0.875371, loss_std=0.081837
-cm_sum=[1878, 758, 294, 2345]

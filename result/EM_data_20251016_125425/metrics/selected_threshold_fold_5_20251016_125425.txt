@@ -1,2 +1,0 @@
-best_threshold=0.492540
-best_f1_val=0.803613
