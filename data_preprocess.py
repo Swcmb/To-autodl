@@ -7,7 +7,8 @@ import scipy.sparse as sp  # 导入scipy的稀疏矩阵模块，用于处理稀�
 import os  # 基于文件目录解析数据路径
 import platform  # 按操作系统控制CPU并行策略（Linux开，Windows关）
 from datetime import datetime
-from label_annotation import load_positive, load_negative_all, sample_negative, attach_labels, save_dataset
+from layer import load_positive, load_negative_all, sample_negative, attach_labels
+from log_output_manager import save_dataset
 from calculating_similarity import calculate_GaussianKernel_sim, getRNA_functional_sim, RNA_fusion_sim, dis_fusion_sim
 from log_output_manager import get_logger
 from enhance import apply_augmentation
